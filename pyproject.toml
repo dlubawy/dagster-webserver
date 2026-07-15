@@ -30,6 +30,7 @@ artifacts = ["dagster_webserver/webapp/build/"]
 
 [project.optional-dependencies]
 notebook = ["nbconvert"]  # notebooks support
+auth = ["pyyaml"]  # YAML user file support
 
 [dependency-groups]
 test = [

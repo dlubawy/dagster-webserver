@@ -1,0 +1,76 @@
+"""Role definitions and permission maps for RBAC.
+
+Defines the built-in roles (CATALOG_VIEWER, VIEWER, LAUNCHER, EDITOR, ADMIN)
+and maps each role to the Dagster Permissions enum values.
+"""
+
+from enum import Enum, unique
+
+from dagster._core.workspace.permissions import PermissionResult, Permissions
+
+
+@unique
+class Role(str, Enum):
+    """Built-in user roles, modeled after Dagster+ cloud PermissionGrant enum."""
+
+    CATALOG_VIEWER = "catalog_viewer"
+    VIEWER = "viewer"
+    LAUNCHER = "launcher"
+    EDITOR = "editor"
+    ADMIN = "admin"
+
+
+def _all_false() -> dict[Permissions, bool]:
+    return {p: False for p in Permissions}
+
+
+def _all_true() -> dict[Permissions, bool]:
+    return {p: True for p in Permissions}
+
+
+# Permission maps per role: {Permissions: enabled}
+ROLE_PERMISSIONS: dict[Role, dict[Permissions, bool]] = {
+    Role.CATALOG_VIEWER: _all_false(),
+    Role.VIEWER: _all_false(),
+    Role.LAUNCHER: {
+        **_all_false(),
+        Permissions.LAUNCH_PIPELINE_EXECUTION: True,
+        Permissions.LAUNCH_PIPELINE_REEXECUTION: True,
+        Permissions.TERMINATE_PIPELINE_EXECUTION: True,
+        Permissions.LAUNCH_PARTITION_BACKFILL: True,
+        Permissions.CANCEL_PARTITION_BACKFILL: True,
+    },
+    Role.EDITOR: _all_true(),
+    Role.ADMIN: _all_true(),
+}
+
+
+def get_role_permissions(role: Role) -> dict[str, PermissionResult]:
+    """Convert a Role enum to a PermissionResult map compatible with
+    ``WorkspaceRequestContext.permissions``.
+    """
+    perm_map = ROLE_PERMISSIONS[role]
+    return {
+        perm: PermissionResult(
+            enabled=enabled,
+            disabled_reason=None
+            if enabled
+            else f"Role {role.value} missing {perm} permission",
+        )
+        for perm, enabled in perm_map.items()
+    }
+
+
+def get_custom_permissions(perm_map: dict[str, bool]) -> dict[str, PermissionResult]:
+    """Build a PermissionResult map from an arbitrary permission dict.
+
+    Used for custom roles where the user explicitly specifies which
+    permissions are enabled.
+    """
+    return {
+        perm: PermissionResult(
+            enabled=enabled,
+            disabled_reason=None if enabled else "Disabled by your role configuration",
+        )
+        for perm, enabled in perm_map.items()
+    }

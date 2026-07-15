@@ -1,0 +1,45 @@
+--- a/js_modules/ui-core/src/app/navigation/mainNavigationItems.tsx
++++ b/js_modules/ui-core/src/app/navigation/mainNavigationItems.tsx
+@@ -284,6 +284,30 @@ const SettingsItem = () => {
+   );
+ };
+ 
++const LogoutItem = () => {
++  const {isCollapsed} = useContext(NavCollapseContext);
++
++  const handleLogout = () => {
++    fetch('/logout', {method: 'POST'})
++      .catch(() => {})
++      .finally(() => {
++        window.location.href = '/login';
++      });
++  };
++
++  return (
++    <Tooltip content="Sign out" placement="right" canShow={isCollapsed}>
++      <UnstyledButton onClick={handleLogout} className={styles.itemButton}>
++        <NavItemContent
++          icon={<Icon name="logout" />}
++          label="Sign out"
++          collapsed={isCollapsed}
++        />
++      </UnstyledButton>
++    </Tooltip>
++  );
++};
++
+ export const getBottomGroups = (_config: NavigationGroupConfig): NavigationGroup[] => {
+   const searchGroup = [
+     {
+@@ -307,6 +331,11 @@ export const getBottomGroups = (_config: NavigationGroupConfig): NavigationGroup
+         element: <CollapseItem />,
+       },
+       {
++        key: 'logout',
++        label: 'Sign out',
++        element: <LogoutItem />,
++      },
++      {
+         key: 'settings',
+         label: 'Settings',
+         element: <SettingsItem />,

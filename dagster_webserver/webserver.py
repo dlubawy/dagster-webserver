@@ -1,19 +1,26 @@
+from __future__ import annotations
+
 import gzip
 import io
 import mimetypes
 import uuid
 from os import listdir, path
-from typing import Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import dagster._check as check
 from dagster import __version__ as dagster_version
 from dagster._annotations import deprecated
 from dagster._core.debug import DebugRunPayload
-from dagster._core.storage.cloud_storage_compute_log_manager import CloudStorageComputeLogManager
+from dagster._core.storage.cloud_storage_compute_log_manager import (
+    CloudStorageComputeLogManager,
+)
 from dagster._core.storage.compute_log_manager import ComputeIOType
 from dagster._core.storage.local_compute_log_manager import LocalComputeLogManager
 from dagster._core.storage.runs.sql_run_storage import SqlRunStorage
-from dagster._core.workspace.context import BaseWorkspaceRequestContext, IWorkspaceProcessContext
+from dagster._core.workspace.context import (
+    BaseWorkspaceRequestContext,
+    IWorkspaceProcessContext,
+)
 from dagster._utils import Counter, traced_counter
 from dagster_graphql import __version__ as dagster_graphql_version
 from dagster_graphql.schema import create_schema
@@ -43,6 +50,9 @@ from dagster_webserver.external_assets import (
 from dagster_webserver.graphql import GraphQLServer
 from dagster_webserver.version import __version__
 
+if TYPE_CHECKING:
+    from dagster_webserver.auth.provider import BaseAuthProvider
+
 mimetypes.init()
 
 TRequestContext = TypeVar("TRequestContext", bound=BaseWorkspaceRequestContext)
@@ -55,6 +65,7 @@ class DagsterWebserver(
 ):
     _process_context: TProcessContext
     _uses_app_path_prefix: bool
+    _auth_provider: BaseAuthProvider | None
 
     def __init__(
         self,
@@ -62,10 +73,12 @@ class DagsterWebserver(
         app_path_prefix: str = "",
         live_data_poll_rate: int | None = None,
         uses_app_path_prefix: bool = True,
+        auth_provider: BaseAuthProvider | None = None,
     ) -> None:
         self._process_context = process_context
         self._live_data_poll_rate = live_data_poll_rate
         self._uses_app_path_prefix = uses_app_path_prefix
+        self._auth_provider = auth_provider
         super().__init__(app_path_prefix)
 
     def build_graphql_schema(self) -> Schema:
@@ -81,7 +94,12 @@ class DagsterWebserver(
         return self._process_context.create_request_context(conn)
 
     def build_middleware(self) -> list[Middleware]:
-        return [Middleware(DagsterTracedCounterMiddleware)]
+        middlewares = [Middleware(DagsterTracedCounterMiddleware)]
+        if self._auth_provider:
+            from dagster_webserver.auth.middleware import AuthMiddleware
+
+            middlewares.append(Middleware(AuthMiddleware, provider=self._auth_provider))
+        return middlewares
 
     def make_security_headers(self) -> dict:
         return {
@@ -156,7 +174,9 @@ class DagsterWebserver(
             notebook = nbformat.reads(notebook_content, as_version=4)
             html_exporter = HTMLExporter()
             (body, resources) = html_exporter.from_notebook_node(notebook)
-            return HTMLResponse("<style>" + resources["inlining"]["css"][0] + "</style>" + body)
+            return HTMLResponse(
+                "<style>" + resources["inlining"]["css"][0] + "</style>" + body
+            )
 
     async def download_captured_logs_endpoint(self, request: Request):
         [*log_key, file_extension] = request.path_params["path"].split("/")
@@ -173,7 +193,11 @@ class DagsterWebserver(
                 )
 
             if isinstance(compute_log_manager, CloudStorageComputeLogManager):
-                io_type = ComputeIOType.STDOUT if file_extension == "out" else ComputeIOType.STDERR
+                io_type = (
+                    ComputeIOType.STDOUT
+                    if file_extension == "out"
+                    else ComputeIOType.STDERR
+                )
                 if compute_log_manager.cloud_storage_has_logs(
                     log_key, io_type
                 ) and not compute_log_manager.has_local_file(log_key, io_type):
@@ -182,7 +206,9 @@ class DagsterWebserver(
                     log_key, file_extension
                 )
             else:
-                location = compute_log_manager.get_captured_local_path(log_key, file_extension)
+                location = compute_log_manager.get_captured_local_path(
+                    log_key, file_extension
+                )
 
             if not location or not path.exists(location):
                 raise HTTPException(404, detail="No log files available for download")
@@ -190,7 +216,9 @@ class DagsterWebserver(
             filebase = "__".join(log_key)
             return FileResponse(location, filename=f"{filebase}.{file_extension}")
 
-    async def report_asset_materialization_endpoint(self, request: Request) -> JSONResponse:
+    async def report_asset_materialization_endpoint(
+        self, request: Request
+    ) -> JSONResponse:
         with self.request_context(request) as context:
             return await handle_report_asset_materialization_request(context, request)
 
@@ -291,6 +319,20 @@ class DagsterWebserver(
 
         return routes
 
+    def _build_auth_routes(self) -> list[Route]:
+        """Build auth-related routes when an auth provider is configured."""
+        from dagster_webserver.auth.routes import (
+            login_endpoint,
+            logout_endpoint,
+            me_endpoint,
+        )
+
+        return [
+            Route("/login", login_endpoint, methods=["GET", "POST"], name="login"),
+            Route("/logout", logout_endpoint, methods=["GET", "POST"], name="logout"),
+            Route("/api/me", me_endpoint, methods=["GET"], name="api-me"),
+        ]
+
     @deprecated(
         breaking_version="2.0",
         subject="/dagit_info and /dagit/notebook endpoint",
@@ -298,7 +340,8 @@ class DagsterWebserver(
     )
     def build_routes(self):
         routes = (
-            [
+            self._build_auth_routes()
+            + [
                 Route("/server_info", self.webserver_info_endpoint),
                 Route("/dagit_info", self.webserver_info_endpoint),
                 Route(
@@ -383,7 +426,9 @@ class DagsterTracedCounterMiddleware:
                 counter = traced_counter.get()
                 if counter and isinstance(counter, Counter):
                     headers = MutableHeaders(scope=message)
-                    headers.append("x-dagster-call-counts", json.dumps(counter.counts()))
+                    headers.append(
+                        "x-dagster-call-counts", json.dumps(counter.counts())
+                    )
 
             return send(message)
 

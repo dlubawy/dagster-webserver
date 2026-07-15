@@ -632,6 +632,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+auth = [
+    { name = "pyyaml" },
+]
 notebook = [
     { name = "nbconvert" },
 ]
@@ -652,10 +655,11 @@ requires-dist = [
     { name = "dagster", specifier = "==1.13.9" },
     { name = "dagster-graphql", specifier = "==1.13.9" },
     { name = "nbconvert", marker = "extra == 'notebook'" },
+    { name = "pyyaml", marker = "extra == 'auth'" },
     { name = "starlette", specifier = "!=0.36.0" },
     { name = "uvicorn", extras = ["standard"] },
 ]
-provides-extras = ["notebook"]
+provides-extras = ["notebook", "auth"]
 
 [package.metadata.requires-dev]
 test = [

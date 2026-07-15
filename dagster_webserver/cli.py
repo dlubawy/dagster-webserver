@@ -10,7 +10,10 @@ import click
 import dagster._check as check
 import uvicorn
 from dagster._annotations import deprecated
-from dagster._cli.utils import assert_no_remaining_opts, get_possibly_temporary_instance_for_cli
+from dagster._cli.utils import (
+    assert_no_remaining_opts,
+    get_possibly_temporary_instance_for_cli,
+)
 from dagster._cli.workspace.cli_target import (
     WORKSPACE_TARGET_WARNING,
     WorkspaceOpts,
@@ -19,9 +22,16 @@ from dagster._cli.workspace.cli_target import (
 from dagster._core.instance import InstanceRef
 from dagster._core.telemetry import START_DAGSTER_WEBSERVER, log_action
 from dagster._core.telemetry_upload import uploading_logging_thread
-from dagster._core.workspace.context import IWorkspaceProcessContext, WorkspaceProcessContext
+from dagster._core.workspace.context import (
+    IWorkspaceProcessContext,
+    WorkspaceProcessContext,
+)
 from dagster._serdes import deserialize_value
-from dagster._utils import DEFAULT_WORKSPACE_YAML_FILENAME, find_free_port, is_port_in_use
+from dagster._utils import (
+    DEFAULT_WORKSPACE_YAML_FILENAME,
+    find_free_port,
+    is_port_in_use,
+)
 from dagster._utils.interrupts import setup_interrupt_handlers
 from dagster._utils.log import configure_loggers
 from dagster_shared.cli import workspace_options
@@ -29,6 +39,12 @@ from dagster_shared.ipc import interrupt_on_ipc_shutdown_message
 
 from dagster_webserver.app import create_app_from_workspace_process_context
 from dagster_webserver.version import __version__
+
+# Auth imports are lazy to avoid hard dependency when auth is not used
+_AUTH_IMPORT_ERROR_MSG = (
+    "Auth requires optional dependencies. Install them with:\n"
+    "  pip install dagster-webserver[auth]"
+)
 
 
 def create_dagster_webserver_cli():
@@ -160,7 +176,9 @@ DEFAULT_POOL_MAX_OVERFLOW = 20
     help="Set the log level for dagster log events.",
     show_default=True,
     default="info",
-    type=click.Choice(["critical", "error", "warning", "info", "debug"], case_sensitive=False),
+    type=click.Choice(
+        ["critical", "error", "warning", "info", "debug"], case_sensitive=False
+    ),
     envvar="DAGSTER_WEBSERVER_LOG_LEVEL",
 )
 @click.option(
@@ -176,7 +194,9 @@ DEFAULT_POOL_MAX_OVERFLOW = 20
     help="Set the log level for any code servers spun up by the webserver.",
     show_default=True,
     default="info",
-    type=click.Choice(["critical", "error", "warning", "info", "debug"], case_sensitive=False),
+    type=click.Choice(
+        ["critical", "error", "warning", "info", "debug"], case_sensitive=False
+    ),
 )
 @click.option(
     "--instance-ref",
@@ -199,6 +219,40 @@ DEFAULT_POOL_MAX_OVERFLOW = 20
     hidden=True,
     help="Internal use only. Pass a readable pipe file descriptor to the webserver process that will be monitored for a shutdown signal.",
 )
+# -- Auth options --
+@click.option(
+    "--auth-provider",
+    type=click.Choice(["session", "api-key", "none"], case_sensitive=False),
+    default="none",
+    help=(
+        "Authentication provider to use. "
+        "'session' uses cookie-based sessions with username/password. "
+        "'api-key' uses Bearer token auth. "
+        "'none' disables auth (default)."
+    ),
+)
+@click.option(
+    "--users-file",
+    type=click.Path(exists=False),
+    default=None,
+    help="Path to a YAML or JSON file defining users and their roles.",
+)
+@click.option(
+    "--session-secret",
+    type=click.STRING,
+    envvar="DAGSTER_WEBSERVER_SESSION_SECRET",
+    default=None,
+    help="Secret key for signing session cookies. Required when --auth-provider=session.",
+)
+@click.option(
+    "--default-role",
+    type=click.Choice(
+        ["catalog_viewer", "viewer", "launcher", "editor", "admin"],
+        case_sensitive=False,
+    ),
+    default="viewer",
+    help="Default role for users when no explicit role is assigned.",
+)
 @click.version_option(version=__version__, prog_name="dagster-webserver")
 @workspace_options
 def dagster_webserver(
@@ -217,6 +271,10 @@ def dagster_webserver(
     instance_ref: str | None,
     live_data_poll_rate: int,
     shutdown_pipe: int | None,
+    auth_provider: str,
+    users_file: str | None,
+    session_secret: str | None,
+    default_role: str,
     **other_opts: object,
 ):
     workspace_opts = WorkspaceOpts.extract_from_cli_options(other_opts)
@@ -244,12 +302,24 @@ def dagster_webserver(
         instance = stack.enter_context(
             get_possibly_temporary_instance_for_cli(
                 cli_command="dagster-webserver",
-                instance_ref=deserialize_value(instance_ref, InstanceRef) if instance_ref else None,
+                instance_ref=deserialize_value(instance_ref, InstanceRef)
+                if instance_ref
+                else None,
                 logger=logger,
             )
         )
         # Allow the instance components to change behavior in the context of a long running server process
-        instance.optimize_for_webserver(db_statement_timeout, db_pool_recycle, db_pool_max_overflow)
+        instance.optimize_for_webserver(
+            db_statement_timeout, db_pool_recycle, db_pool_max_overflow
+        )
+
+        # -- Build auth provider if requested --
+        auth_provider_instance = _build_auth_provider(
+            auth_provider=auth_provider,
+            users_file=users_file,
+            session_secret=session_secret,
+            default_role=default_role,
+        )
 
         with WorkspaceProcessContext(
             instance,
@@ -265,6 +335,7 @@ def dagster_webserver(
                 path_prefix,
                 uvicorn_log_level,
                 live_data_poll_rate,
+                auth_provider=auth_provider_instance,
             )
 
 
@@ -288,6 +359,7 @@ def host_dagster_ui_with_workspace_process_context(
     path_prefix: str,
     log_level: str,
     live_data_poll_rate: int | None = None,
+    auth_provider: object | None = None,
 ):
     check.inst_param(
         workspace_process_context, "workspace_process_context", IWorkspaceProcessContext
@@ -299,14 +371,25 @@ def host_dagster_ui_with_workspace_process_context(
 
     logger = logging.getLogger(WEBSERVER_LOGGER_NAME)
 
+    if auth_provider is not None:
+        logger.info(
+            "Authentication enabled (provider: %s)", type(auth_provider).__name__
+        )
+
     app = create_app_from_workspace_process_context(
-        workspace_process_context, path_prefix, live_data_poll_rate, lifespan=_lifespan
+        workspace_process_context,
+        path_prefix,
+        live_data_poll_rate,
+        auth_provider=auth_provider,
+        lifespan=_lifespan,
     )
 
     if not port:
         if is_port_in_use(host, DEFAULT_WEBSERVER_PORT):
             port = find_free_port()
-            logger.warning(f"Port {DEFAULT_WEBSERVER_PORT} is in use - using port {port} instead")
+            logger.warning(
+                f"Port {DEFAULT_WEBSERVER_PORT} is in use - using port {port} instead"
+            )
         else:
             port = DEFAULT_WEBSERVER_PORT
 
@@ -321,6 +404,66 @@ def host_dagster_ui_with_workspace_process_context(
             port=port,
             log_level=log_level,
         )
+
+
+# ---------------------------------------------------------------------------
+# Auth helper functions
+# ---------------------------------------------------------------------------
+
+
+def _build_auth_provider(
+    auth_provider: str,
+    users_file: str | None,
+    session_secret: str | None,
+    default_role: str,
+) -> object | None:
+    """Build an auth provider instance from CLI options.
+
+    Returns ``None`` when ``auth_provider == "none"``.
+    """
+    auth_provider = auth_provider.lower()
+    if auth_provider == "none":
+        return None
+
+    from dagster_webserver.auth.provider import (
+        ApiKeyAuthProvider,
+        AuthConfig,
+        SessionAuthProvider,
+    )
+    from dagster_webserver.auth.users import FileUserBackend, InMemoryUserBackend
+
+    config = AuthConfig(
+        default_role=default_role,
+        allowed_routes=["login", "static", "root_static", "favicon_static"],
+    )
+
+    # Build user backend from --users-file
+    if users_file:
+        user_backend = FileUserBackend(users_file)
+    else:
+        # Default admin user for quick start
+        user_backend = InMemoryUserBackend(
+            {
+                "admin": {"password": "admin", "role": "admin"},
+            }
+        )
+
+    if auth_provider == "session":
+        if not session_secret:
+            import secrets
+
+            session_secret = secrets.token_hex(32)
+            logging.getLogger(WEBSERVER_LOGGER_NAME).warning(
+                "No --session-secret provided. A random secret was generated. "
+                "Set DAGSTER_WEBSERVER_SESSION_SECRET or use --session-secret for persistence."
+            )
+        config._session_secret = session_secret  # type: ignore[attr-defined]
+        return SessionAuthProvider(user_backend, config=config)
+
+    if auth_provider == "api-key":
+        return ApiKeyAuthProvider(user_backend, config=config)
+
+    raise click.BadParameter(f"Unknown auth provider: {auth_provider}")
 
 
 cli = create_dagster_webserver_cli()
