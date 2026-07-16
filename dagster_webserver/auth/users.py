@@ -5,19 +5,29 @@ Provides:
 - ``UserBackend`` — abstract base class for credential/user storage
 - ``InMemoryUserBackend`` — in-memory store for simple deployments
 - ``FileUserBackend`` — YAML/JSON file-based store
+
+Password hashing uses **argon2-cffi** (argon2id, the OWASP 2025
+recommended algorithm).  Pre-hashed passwords in the users file
+should use the argon2 PHC string format (starts with ``$argon2id$``).
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+
 logger = logging.getLogger("dagster-webserver.auth")
+
+# Module-level hasher instance — safe to reuse across requests.
+# Uses argon2id (hybrid of Argon2d + Argon2i), the OWASP 2025
+# recommended memory-hard password hashing algorithm.
+_PH = PasswordHasher()
 
 
 @dataclass(frozen=True)
@@ -57,25 +67,29 @@ class UserBackend(ABC):
         ...
 
 
-def _hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
-    """Hash a password with a random salt using SHA-256.
+def _hash_password(password: str) -> str:
+    """Hash a password using argon2id.
 
-    Returns (hashed_password, salt).  For production deployments,
-    ``bcrypt`` should be used instead — this simple hash is sufficient
-    for the initial implementation and easy to swap out.
+    Returns an argon2 PHC string (e.g. ``$argon2id$v=19$m=65536...``).
     """
-    import secrets
-
-    if salt is None:
-        salt = secrets.token_hex(16)
-    hashed = hashlib.sha256(f"{salt}{password}".encode("utf-8")).hexdigest()
-    return hashed, salt
+    return _PH.hash(password)
 
 
-def _verify_password(password: str, hashed: str, salt: str) -> bool:
-    """Verify a password against a stored hash."""
-    expected, _ = _hash_password(password, salt)
-    return hmac.compare_digest(expected, hashed)
+def _verify_password(password: str, hashed: str) -> bool:
+    """Verify a password against an argon2 hash.
+
+    Returns ``True`` if the password matches, ``False`` otherwise.
+    """
+    try:
+        _PH.verify(hashed, password)
+        return True
+    except VerifyMismatchError:
+        return False
+
+
+def _is_argon2_hash(value: str) -> bool:
+    """Check whether *value* looks like an argon2 PHC hash string."""
+    return value.startswith("$argon2")
 
 
 @dataclass
@@ -91,6 +105,10 @@ class InMemoryUserBackend(UserBackend):
             "admin": {"password": "changeme", "role": "admin"},
             "viewer": {"password": "view", "role": "viewer"},
         })
+
+    Plain-text passwords are automatically hashed with argon2id at
+    initialisation.  Pre-hashed passwords (``password_hash`` key with
+    an argon2 PHC string) are accepted as-is.
     """
 
     _raw_users: dict[str, dict[str, Any]]
@@ -99,11 +117,9 @@ class InMemoryUserBackend(UserBackend):
     def __post_init__(self) -> None:
         self._users = {}
         for username, data in self._raw_users.items():
-            password = data["password"]
-            if isinstance(password, str) and not password.startswith("$"):
-                hashed, salt = _hash_password(password)
-                data["password_hash"] = hashed
-                data["salt"] = salt
+            password = data.get("password")
+            if password and isinstance(password, str) and not _is_argon2_hash(password):
+                data["password_hash"] = _hash_password(password)
             self._users[username] = data
         logger.info("Loaded %d users into InMemoryUserBackend", len(self._users))
 
@@ -113,8 +129,7 @@ class InMemoryUserBackend(UserBackend):
             return None
 
         stored_hash = user_data.get("password_hash")
-        salt = user_data.get("salt")
-        if stored_hash and salt and _verify_password(password, stored_hash, salt):
+        if stored_hash and _verify_password(password, stored_hash):
             return self._build_user(username, user_data)
         return None
 
@@ -147,12 +162,12 @@ class FileUserBackend(UserBackend):
             password: view
             role: viewer
 
-    Pre-hashed passwords are also supported::
+    Plain-text passwords are automatically hashed with argon2id when
+    the file is loaded.  Pre-hashed passwords are also supported::
 
         users:
           admin:
-            password_hash: <sha256 hex>
-            salt: <hex salt>
+            password_hash: $argon2id$v=19$m=65536...
             role: admin
     """
 
@@ -186,10 +201,8 @@ class FileUserBackend(UserBackend):
             if not isinstance(data, dict):
                 continue
             password = data.get("password")
-            if password and isinstance(password, str) and not password.startswith("$"):
-                hashed, salt = _hash_password(password)
-                data["password_hash"] = hashed
-                data["salt"] = salt
+            if password and isinstance(password, str) and not _is_argon2_hash(password):
+                data["password_hash"] = _hash_password(password)
             users[username] = data
 
         logger.info("Loaded %d users from %s", len(users), self._file_path)
@@ -201,8 +214,7 @@ class FileUserBackend(UserBackend):
             return None
 
         stored_hash = user_data.get("password_hash")
-        salt = user_data.get("salt")
-        if stored_hash and salt and _verify_password(password, stored_hash, salt):
+        if stored_hash and _verify_password(password, stored_hash):
             return self._build_user(username, user_data)
         return None
 

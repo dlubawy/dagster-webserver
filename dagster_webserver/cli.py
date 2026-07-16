@@ -62,8 +62,9 @@ DEFAULT_POOL_RECYCLE = 3600  # 1 hr
 DEFAULT_POOL_MAX_OVERFLOW = 20
 
 
-@click.command(
+@click.group(
     name="dagster-webserver",
+    invoke_without_command=True,
     help=textwrap.dedent(
         f"""
         Run dagster-webserver. Loads a code location.
@@ -72,27 +73,40 @@ DEFAULT_POOL_MAX_OVERFLOW = 20
 
         Examples:
 
-        1. dagster-webserver (works if ./{DEFAULT_WORKSPACE_YAML_FILENAME} exists)
+        1. dagster-webserver start (works if ./{DEFAULT_WORKSPACE_YAML_FILENAME} exists)
 
-        2. dagster-webserver -w path/to/{DEFAULT_WORKSPACE_YAML_FILENAME}
+        2. dagster-webserver start -w path/to/{DEFAULT_WORKSPACE_YAML_FILENAME}
 
-        3. dagster-webserver -f path/to/file.py
+        3. dagster-webserver start -f path/to/file.py
 
-        4. dagster-webserver -f path/to/file.py -d path/to/working_directory
+        4. dagster-webserver start -f path/to/file.py -d path/to/working_directory
 
-        5. dagster-webserver -m some_module
+        5. dagster-webserver start -m some_module
 
-        6. dagster-webserver -f path/to/file.py -a define_repo
+        6. dagster-webserver start -f path/to/file.py -a define_repo
 
-        7. dagster-webserver -m some_module -a define_repo
+        7. dagster-webserver start -m some_module -a define_repo
 
-        8. dagster-webserver -p 3333
+        8. dagster-webserver start -p 3333
 
         Options can also provide arguments via environment variables prefixed with DAGSTER_WEBSERVER.
 
-        For example, DAGSTER_WEBSERVER_PORT=3333 dagster-webserver
+        For example, DAGSTER_WEBSERVER_PORT=3333 dagster-webserver start
     """
     ),
+)
+@click.version_option(version=__version__, prog_name="dagster-webserver")
+@click.pass_context
+def dagster_webserver(ctx: click.Context, **_kwargs: object):
+    """Top-level CLI group for dagster-webserver."""
+    if ctx.invoked_subcommand is None:
+        # No subcommand given — default to `start`
+        ctx.invoke(start)
+
+
+@dagster_webserver.command(
+    name="start",
+    help="Start the Dagster webserver.",
 )
 @click.option(
     "--host",
@@ -222,13 +236,26 @@ DEFAULT_POOL_MAX_OVERFLOW = 20
 # -- Auth options --
 @click.option(
     "--auth-provider",
-    type=click.Choice(["session", "api-key", "none"], case_sensitive=False),
+    type=click.Choice(["session", "api-key", "database", "none"], case_sensitive=False),
     default="none",
     help=(
         "Authentication provider to use. "
         "'session' uses cookie-based sessions with username/password. "
         "'api-key' uses Bearer token auth. "
+        "'database' uses cookie-based sessions backed by a database. "
         "'none' disables auth (default)."
+    ),
+)
+@click.option(
+    "--auth-database-url",
+    type=click.STRING,
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    default=None,
+    help=(
+        "SQLAlchemy URL for the auth database "
+        "(e.g. sqlite+aiosqlite:///auth.db or "
+        "postgresql+asyncpg://user:pass@host/db). "
+        "Required when --auth-provider=database."
     ),
 )
 @click.option(
@@ -253,9 +280,8 @@ DEFAULT_POOL_MAX_OVERFLOW = 20
     default="viewer",
     help="Default role for users when no explicit role is assigned.",
 )
-@click.version_option(version=__version__, prog_name="dagster-webserver")
 @workspace_options
-def dagster_webserver(
+def start(
     host: str,
     port: int,
     path_prefix: str,
@@ -274,9 +300,11 @@ def dagster_webserver(
     auth_provider: str,
     users_file: str | None,
     session_secret: str | None,
+    auth_database_url: str | None,
     default_role: str,
     **other_opts: object,
 ):
+    """Start the Dagster webserver."""
     workspace_opts = WorkspaceOpts.extract_from_cli_options(other_opts)
     assert_no_remaining_opts(other_opts)
 
@@ -318,6 +346,7 @@ def dagster_webserver(
             auth_provider=auth_provider,
             users_file=users_file,
             session_secret=session_secret,
+            auth_database_url=auth_database_url,
             default_role=default_role,
         )
 
@@ -415,11 +444,12 @@ def _build_auth_provider(
     auth_provider: str,
     users_file: str | None,
     session_secret: str | None,
+    auth_database_url: str | None,
     default_role: str,
 ) -> object | None:
     """Build an auth provider instance from CLI options.
 
-    Returns ``None`` when ``auth_provider == "none"``.
+    Returns ``None`` when ``auth_provider == "none"``."``.
     """
     auth_provider = auth_provider.lower()
     if auth_provider == "none":
@@ -436,6 +466,36 @@ def _build_auth_provider(
         default_role=default_role,
         allowed_routes=["login", "static", "root_static", "favicon_static"],
     )
+
+    # Handle database-backed auth
+    if auth_provider == "database":
+        if not auth_database_url:
+            raise click.BadParameter(
+                "--auth-database-url is required when --auth-provider=database",
+                param_hint="--auth-database-url",
+            )
+        try:
+            from dagster_webserver.auth.db_backend import DatabaseUserBackend
+        except ImportError as exc:
+            raise click.UsageError(
+                "Database auth requires optional dependencies. Install with:\n"
+                "  pip install dagster-webserver[auth]"
+            ) from exc
+
+        if not session_secret:
+            import secrets
+
+            session_secret = secrets.token_hex(32)
+            logging.getLogger(WEBSERVER_LOGGER_NAME).warning(
+                "No --session-secret provided. A random secret was generated. "
+                "Set DAGSTER_WEBSERVER_SESSION_SECRET or use --session-secret for persistence."
+            )
+        config._session_secret = session_secret  # type: ignore[attr-defined]
+        user_backend = DatabaseUserBackend(
+            auth_database_url,
+            default_role=default_role,
+        )
+        return SessionAuthProvider(user_backend, config=config)
 
     # Build user backend from --users-file
     if users_file:
@@ -464,6 +524,182 @@ def _build_auth_provider(
         return ApiKeyAuthProvider(user_backend, config=config)
 
     raise click.BadParameter(f"Unknown auth provider: {auth_provider}")
+
+
+# ---------------------------------------------------------------------------
+# ``dagster-webserver db`` subcommand group
+# ---------------------------------------------------------------------------
+
+
+@dagster_webserver.group(name="db", help="Manage the auth database.")
+def db_cli():
+    """Database management commands."""
+    pass
+
+
+@db_cli.command(name="init-admin", help="Bootstrap the first admin user.")
+@click.option("--username", required=True, help="Admin username.")
+@click.option("--password", required=True, help="Admin password.")
+@click.option(
+    "--database-url",
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_init_admin(username: str, password: str, database_url: str) -> None:
+    """Create the first admin user in the auth database."""
+    try:
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+    except ImportError as exc:
+        raise click.UsageError(
+            "Database auth requires optional dependencies. Install with:\n"
+            "  pip install dagster-webserver[auth]"
+        ) from exc
+
+    backend = DatabaseUserBackend(database_url, create_tables=True)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(backend.create_user(username, password, role="admin"))
+    finally:
+        loop.close()
+    click.echo(f"Admin user '{username}' created successfully.")
+
+
+@db_cli.command(name="create-role", help="Create a new custom role.")
+@click.option("--name", required=True, help="Role name.")
+@click.option(
+    "--permissions",
+    required=True,
+    help="JSON object mapping permission names to booleans "
+    '(e.g. \'{"read_workspace": true, "launch_pipeline_execution": false}\').',
+)
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_create_role(name: str, permissions: str, database_url: str) -> None:
+    """Create a custom role with the given permissions."""
+    import json
+
+    try:
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+    except ImportError as exc:
+        raise click.UsageError(
+            "Database auth requires optional dependencies. Install with:\n"
+            "  pip install dagster-webserver[auth]"
+        ) from exc
+
+    try:
+        perm_map = json.loads(permissions)
+    except json.JSONDecodeError as exc:
+        raise click.BadParameter("Invalid JSON", hint=permissions) from exc
+
+    backend = DatabaseUserBackend(database_url, create_tables=True)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(backend.create_role(name, perm_map))
+    finally:
+        loop.close()
+    click.echo(f"Custom role '{name}' created successfully.")
+
+
+@db_cli.command(name="list-roles", help="List all roles (built-in and custom).")
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_list_roles(database_url: str) -> None:
+    """List all roles."""
+    try:
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+    except ImportError as exc:
+        raise click.UsageError(
+            "Database auth requires optional dependencies. Install with:\n"
+            "  pip install dagster-webserver[auth]"
+        ) from exc
+
+    backend = DatabaseUserBackend(database_url, create_tables=True)
+    loop = asyncio.new_event_loop()
+    try:
+        roles = loop.run_until_complete(backend.list_roles())
+    finally:
+        loop.close()
+
+    for role in roles:
+        tag = "[built-in]" if role.is_builtin else "[custom]"
+        enabled = [k for k, v in role.permissions.items() if v]
+        click.echo(f"  {role.name:<20} {tag:<12} {len(enabled)} permissions enabled")
+
+
+@db_cli.command(name="update-role", help="Update a custom role's permissions.")
+@click.option("--name", required=True, help="Role name.")
+@click.option(
+    "--permissions",
+    required=True,
+    help="JSON object mapping permission names to booleans.",
+)
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_update_role(name: str, permissions: str, database_url: str) -> None:
+    """Update a custom role's permissions."""
+    import json
+
+    try:
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+    except ImportError as exc:
+        raise click.UsageError(
+            "Database auth requires optional dependencies. Install with:\n"
+            "  pip install dagster-webserver[auth]"
+        ) from exc
+
+    try:
+        perm_map = json.loads(permissions)
+    except json.JSONDecodeError as exc:
+        raise click.BadParameter("Invalid JSON", hint=permissions) from exc
+
+    backend = DatabaseUserBackend(database_url, create_tables=True)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(backend.update_role(name, permissions=perm_map))
+    finally:
+        loop.close()
+    click.echo(f"Role '{name}' updated successfully.")
+
+
+@db_cli.command(name="delete-role", help="Delete a custom role.")
+@click.option("--name", required=True, help="Role name.")
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_delete_role(name: str, database_url: str) -> None:
+    """Delete a custom role."""
+    try:
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+    except ImportError as exc:
+        raise click.UsageError(
+            "Database auth requires optional dependencies. Install with:\n"
+            "  pip install dagster-webserver[auth]"
+        ) from exc
+
+    backend = DatabaseUserBackend(database_url, create_tables=True)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(backend.delete_role(name))
+    finally:
+        loop.close()
+    click.echo(f"Role '{name}' deleted successfully.")
 
 
 cli = create_dagster_webserver_cli()

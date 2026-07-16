@@ -96,6 +96,74 @@ Five built-in roles are available, modelled after Dagster+ cloud:
 Custom permissions can be defined per user by setting ``role: custom`` and
 providing an explicit ``custom_permissions`` map in the users file.
 
+Database-backed auth
+~~~~~~~~~~~~~~~~~~~~
+
+For deployments that need runtime user management (create, update, delete
+users without restarting), use the ``database`` auth provider:
+
+.. code-block:: sh
+
+  # SQLite (dev)
+  dagster-webserver --auth-provider database \
+    --auth-database-url sqlite+aiosqlite:///auth.db \
+    --session-secret my-secret-key
+
+  # PostgreSQL (production)
+  dagster-webserver --auth-provider database \
+    --auth-database-url postgresql+asyncpg://user:pass@host/db \
+    --session-secret my-secret-key
+
+The first time the server starts, it creates the ``roles`` and ``users``
+tables and seeds the five built-in roles automatically.
+
+Bootstrap the first admin user:
+
+.. code-block:: sh
+
+  dagster-webserver db init-admin \
+    --username admin \
+    --password changeme \
+    --database-url sqlite+aiosqlite:///auth.db
+
+Managing custom roles
+^^^^^^^^^^^^^^^^^^^^^
+
+Custom roles are first-class entities stored in the database.  Create one:
+
+.. code-block:: sh
+
+  dagster-webserver db create-role \
+    --name analyst \
+    --permissions '{"LAUNCH_PIPELINE_EXECUTION": true, "LAUNCH_PIPELINE_REEXECUTION": true}' \
+    --database-url sqlite+aiosqlite:///auth.db
+
+List all roles (built-in and custom):
+
+.. code-block:: sh
+
+  dagster-webserver db list-roles --database-url sqlite+aiosqlite:///auth.db
+
+Update or delete custom roles:
+
+.. code-block:: sh
+
+  dagster-webserver db update-role --name analyst --permissions '{...}' --database-url sqlite+aiosqlite:///auth.db
+  dagster-webserver db delete-role --name analyst --database-url sqlite+aiosqlite:///auth.db
+
+Dependencies
+^^^^^^^^^^^^
+
+- SQLite (dev): ``pip install dagster-webserver[auth]``
+- PostgreSQL (production): ``pip install dagster-webserver[auth-db]``
+
+Default role fallback
+^^^^^^^^^^^^^^^^^^^^^
+
+If a user is created without an explicit role assignment (``role_id`` is
+``NULL``), the ``--default-role`` flag determines their effective role.
+This defaults to ``viewer``.
+
 API key auth
 ~~~~~~~~~~~~
 
@@ -120,8 +188,13 @@ CLI options for auth
 
    * - Option
      - Description
-   * - ``--auth-provider {session,api-key,none}``
+   * - ``--auth-provider {session,api-key,database,none}``
      - Authentication mode. ``none`` is the default (no auth).
+   * - ``--auth-database-url URL``
+     - SQLAlchemy connection string for the auth database
+       (e.g. ``sqlite+aiosqlite:///auth.db`` or
+       ``postgresql+asyncpg://user:pass@host/db``).
+       Required when ``--auth-provider=database``.
    * - ``--users-file PATH``
      - Path to a YAML or JSON file defining users, passwords, and roles.
    * - ``--session-secret SECRET``

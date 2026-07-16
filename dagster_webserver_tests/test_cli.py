@@ -13,6 +13,12 @@ def test_invoke_cli():
     assert "dagster-webserver, version" in result.output
 
 
+def test_invoke_cli_start_subcommand():
+    runner = CliRunner()
+    result = runner.invoke(dagster_webserver, ["start", "--help"])
+    assert "Start the Dagster webserver" in result.output
+
+
 @pytest.mark.parametrize("prefix", ["DAGSTER_WEBSERVER", "DAGIT"])
 def test_invoke_cli_with_env_var_options(prefix):
     process = subprocess.Popen(
@@ -28,16 +34,20 @@ def test_invoke_cli_with_env_var_options(prefix):
 
 def test_invoke_cli_wrapper_with_nonexistant_option():
     process = subprocess.Popen(
-        ["dagster-webserver", "--fubar"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        ["dagster-webserver", "start", "--fubar"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     _, stderr = process.communicate()
     assert process.returncode != 0
-    assert b"error: no such option '--fubar'.\n" in stderr.lower()
+    assert b"no such option" in stderr.lower()
 
 
 def test_invoke_cli_wrapper_with_invalid_option():
     process = subprocess.Popen(
-        ["dagster-webserver", "-d", "."], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        ["dagster-webserver", "start", "-d", "."],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     _, stderr = process.communicate()
     assert process.returncode != 0

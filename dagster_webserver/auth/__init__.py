@@ -14,6 +14,7 @@ Users
 - ``UserBackend`` — abstract base class for credential/user storage
 - ``InMemoryUserBackend`` — in-memory user store
 - ``FileUserBackend`` — YAML/JSON file-based store
+- ``DatabaseUserBackend`` — relational database user store (SQLite / PostgreSQL)
 
 Providers
 ~~~~~~~~~
@@ -42,6 +43,7 @@ from dagster_webserver.auth.context import (
     AuthenticatedWorkspaceProcessContext,
     AuthenticatedWorkspaceRequestContext,
 )
+from dagster_webserver.auth.db_backend import DatabaseUserBackend
 from dagster_webserver.auth.middleware import AuthMiddleware
 from dagster_webserver.auth.provider import (
     ApiKeyAuthProvider,
@@ -72,6 +74,7 @@ __all__ = [
     "UserBackend",
     "InMemoryUserBackend",
     "FileUserBackend",
+    "DatabaseUserBackend",
     # Providers
     "AuthConfig",
     "BaseAuthProvider",
