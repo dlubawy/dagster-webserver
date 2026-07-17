@@ -320,7 +320,7 @@
                         root = old.src;
                         fileset = lib.fileset.unions [
                           (old.src + "/pyproject.toml")
-                          (old.src + "/README.rst")
+                          (old.src + "/README.md")
                           (old.src + "/dagster_webserver")
                         ];
                       };
