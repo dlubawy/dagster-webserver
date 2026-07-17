@@ -7,13 +7,13 @@ Web UI for Dagster.
 ### Basic usage
 
 ```sh
-dagster-webserver -p 3333
+dagster-webserver start -p 3333
 ```
 
 Running with a workspace file:
 
 ```sh
-dagster-webserver -w path/to/workspace.yaml
+dagster-webserver start -w path/to/workspace.yaml
 
 ```
 
@@ -25,7 +25,7 @@ Auth is **disabled by default** — enable it with the `--auth-provider` flag.
 ### Enabling session-based auth
 
 ```sh
-dagster-webserver --auth-provider session --session-secret my-secret-key
+dagster-webserver start --auth-provider session --session-secret my-secret-key
 ```
 
 This starts the webserver with cookie-based sessions. A default `admin` user
@@ -53,7 +53,7 @@ users:
 Then start the webserver:
 
 ```sh
-dagster-webserver --auth-provider session --users-file users.yaml --session-secret my-secret-key
+dagster-webserver start --auth-provider session --users-file users.yaml --session-secret my-secret-key
 ```
 
 ### Roles
@@ -80,12 +80,12 @@ users without restarting), use the `database` auth provider:
 
 ```sh
 # SQLite (dev)
-dagster-webserver --auth-provider database \
+dagster-webserver start --auth-provider database \
   --auth-database-url sqlite+aiosqlite:///auth.db \
   --session-secret my-secret-key
 
 # PostgreSQL (production)
-dagster-webserver --auth-provider database \
+dagster-webserver start --auth-provider database \
   --auth-database-url postgresql+asyncpg://user:pass@host/db \
   --session-secret my-secret-key
 ```
@@ -142,7 +142,7 @@ This defaults to `viewer`.
 For programmatic access (CI/CD, scripts), use the `api-key` provider:
 
 ```sh
-dagster-webserver --auth-provider api-key --users-file users.yaml
+dagster-webserver start --auth-provider api-key --users-file users.yaml
 ```
 
 Then authenticate requests with a `Bearer` token:
