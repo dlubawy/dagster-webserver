@@ -1,0 +1,82 @@
+diff --git a/js_modules/ui-core/src/app/navigation/AdminPortalItem.tsx b/js_modules/ui-core/src/app/navigation/AdminPortalItem.tsx
+new file mode 100644
+index 0000000000..bcb377ca43
+--- /dev/null
++++ b/js_modules/ui-core/src/app/navigation/AdminPortalItem.tsx
+@@ -0,0 +1,52 @@
++import {Icon, Tooltip} from '@dagster-io/ui-components';
++import {useContext, useEffect, useState} from 'react';
++
++import {NavCollapseContext} from './NavCollapseProvider';
++import {NavItemContent} from './NavItemContent';
++import styles from './css/MainNavigation.module.css';
++
++// Calls /api/me to check if the current user has any admin portal permission.
++async function fetchAdminAccess(): Promise<boolean> {
++  try {
++    const resp = await fetch('/api/me', {credentials: 'same-origin'});
++    if (!resp.ok) return false;
++    const data = await resp.json();
++    return !!data.hasAnyAdminPermission;
++  } catch {
++    return false;
++  }
++}
++
++export const AdminPortalItem = () => {
++  const {isCollapsed} = useContext(NavCollapseContext);
++  const [hasAccess, setHasAccess] = useState(false);
++  const [loading, setLoading] = useState(true);
++
++  useEffect(() => {
++    let cancelled = false;
++    fetchAdminAccess().then((v) => {
++      if (!cancelled) {
++        setHasAccess(v);
++        setLoading(false);
++      }
++    });
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
++  if (loading || !hasAccess) {
++    return null;
++  }
++
++  // Use a plain <a> tag (not NavLink) because /admin is a server-rendered
++  // Jinja2 route, not a React SPA route. NavLink would try to handle it
++  // client-side, causing a redirect or 404.
++  return (
++    <Tooltip content="Admin Portal" placement="right" canShow={isCollapsed}>
++      <a href="/admin" className={styles.link}>
++        <NavItemContent icon={<Icon name="admin" />} label="Admin" collapsed={isCollapsed} />
++      </a>
++    </Tooltip>
++  );
++};
+diff --git a/js_modules/ui-core/src/app/navigation/mainNavigationItems.tsx b/js_modules/ui-core/src/app/navigation/mainNavigationItems.tsx
+index 97be880656..084ef2dbae 100644
+--- a/js_modules/ui-core/src/app/navigation/mainNavigationItems.tsx
++++ b/js_modules/ui-core/src/app/navigation/mainNavigationItems.tsx
+@@ -20,6 +20,7 @@ import {NavItemContent} from './NavItemContent';
+ import {NavItemWithLink} from './NavItemWithLink';
+ import {NavigationGroup} from './types';
+ import {UserSettingsDialog} from '../UserSettingsDialog/UserSettingsDialog';
++import {AdminPortalItem} from './AdminPortalItem';
+ 
+ type NavigationGroupConfig = {
+   featureFlags: Record<FeatureFlag, boolean>;
+@@ -306,6 +307,11 @@ export const getBottomGroups = (_config: NavigationGroupConfig): NavigationGroup
+         label: 'Collapse',
+         element: <CollapseItem />,
+       },
++      {
++        key: 'admin',
++        label: 'Admin',
++        element: <AdminPortalItem />,
++      },
+       {
+         key: 'settings',
+         label: 'Settings',

@@ -51,6 +51,7 @@ from dagster_webserver.graphql import GraphQLServer
 from dagster_webserver.version import __version__
 
 if TYPE_CHECKING:
+    from dagster_webserver.admin.portal import AdminPortal
     from dagster_webserver.auth.provider import BaseAuthProvider
 
 mimetypes.init()
@@ -66,6 +67,7 @@ class DagsterWebserver(
     _process_context: TProcessContext
     _uses_app_path_prefix: bool
     _auth_provider: BaseAuthProvider | None
+    _admin_portal: AdminPortal | None
 
     def __init__(
         self,
@@ -74,11 +76,13 @@ class DagsterWebserver(
         live_data_poll_rate: int | None = None,
         uses_app_path_prefix: bool = True,
         auth_provider: BaseAuthProvider | None = None,
+        admin_portal: AdminPortal | None = None,
     ) -> None:
         self._process_context = process_context
         self._live_data_poll_rate = live_data_poll_rate
         self._uses_app_path_prefix = uses_app_path_prefix
         self._auth_provider = auth_provider
+        self._admin_portal = admin_portal
         super().__init__(app_path_prefix)
 
     def build_graphql_schema(self) -> Schema:
@@ -394,6 +398,10 @@ class DagsterWebserver(
                 Route("/", self.index_html_endpoint),
             ]
         )
+
+        # Mount admin portal if configured
+        if self._admin_portal:
+            self._admin_portal.mount_to(routes)
 
         if self._app_path_prefix:
 

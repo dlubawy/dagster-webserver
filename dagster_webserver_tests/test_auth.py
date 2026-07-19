@@ -106,8 +106,14 @@ class TestRolePermissions:
             assert not result.enabled, f"VIEWER should not have {perm}"
 
     def test_editor_has_all_permissions(self):
+        from dagster_webserver.admin.permissions import AdminPermission
+
+        admin_perm_keys = {p.value for p in AdminPermission}
         perms = get_role_permissions(Role.EDITOR)
         for perm, result in perms.items():
+            if perm in admin_perm_keys:
+                # Admin permissions are only enabled for ADMIN role
+                continue
             assert result.enabled, f"EDITOR should have {perm}"
 
     def test_admin_has_all_permissions(self):
@@ -532,7 +538,10 @@ class TestAuthIntegration:
             assert not perm["value"], f"Viewer should not have {perm['permission']}"
 
     def test_graphql_permissions_editor(self, app_with_auth):
-        """After login as editor, all permissions should be enabled."""
+        """After login as editor, all Dagster permissions should be enabled."""
+        from dagster_webserver.admin.permissions import AdminPermission
+
+        admin_perm_keys = {p.value for p in AdminPermission}
         client = TestClient(app_with_auth, raise_server_exceptions=False)
         client.post("/login", data={"username": "editor", "password": "editor_pass"})
 
@@ -542,6 +551,9 @@ class TestAuthIntegration:
         data = resp.json()
         perms = data["data"]["permissions"]
         for perm in perms:
+            if perm["permission"] in admin_perm_keys:
+                # Admin permissions are only enabled for ADMIN role
+                continue
             assert perm["value"], f"Editor should have {perm['permission']}"
 
     def test_graphql_permissions_launcher(self, app_with_auth):

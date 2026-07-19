@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+{% block title %}{{ view.plural_label }} — Dagster Admin{% endblock %}
+{% block content %}
+<div class="actions-bar">
+  <h2 style="flex: 1;">{{ view.plural_label }}</h2>
+  {% if view.can_create(request) %}
+  <a href="/admin/{{ view.identity }}/create" class="btn btn-primary">
+    <i class="fas fa-plus"></i> Create {{ view.label }}
+  </a>
+  {% endif %}
+</div>
+
+{% if actions %}
+<form method="post" action="/admin/{{ view.identity }}/action" id="batch-form">
+  <div style="margin-bottom: 12px; display: flex; gap: 8px; align-items: center;">
+    <select name="action_name" id="batch-action" style="padding: 6px 10px; border: 1px solid #d2d6de; border-radius: 6px; font-size: 13px;">
+      <option value="">Batch action…</option>
+      {% for a in actions %}
+      <option value="{{ a.name }}">{{ a.text }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="btn btn-secondary btn-sm" disabled id="batch-btn">Apply</button>
+  </div>
+</form>
+{% endif %}
+
+<table>
+  <thead>
+    <tr>
+      {% if actions %}<th style="width: 36px;"><input type="checkbox" id="select-all"/></th>{% endif %}
+      {% for col in view.list_columns %}
+      <th>{{ col | replace('_', ' ') | title }}</th>
+      {% endfor %}
+      {% if row_actions %}<th style="width: 140px;">Actions</th>{% endif %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for item in items %}
+    <tr>
+      {% if actions %}
+      <td>
+        <input type="checkbox" class="row-check" value="{{ item.username if view.identity == 'users' else item.name }}"/>
+      </td>
+      {% endif %}
+      {% for col in view.list_columns %}
+      <td>
+        {% if col == 'is_active' or col == 'is_builtin' %}
+          <span class="badge badge-{{ item[col] | lower }}">{{ item[col] | lower | replace('true', 'Yes') | replace('false', 'No') }}</span>
+        {% elif col == 'role' %}
+          <span style="text-transform: capitalize;">{{ item[col] | replace('_', ' ') }}</span>
+        {% else %}
+          {{ item[col] }}
+        {% endif %}
+      </td>
+      {% endfor %}
+      {% if row_actions %}
+      <td>
+        {% for ra in row_actions %}
+        {% if not ra.exclude_from_list %}
+        <form method="post" action="/admin/{{ view.identity }}/row-action" style="display: inline;"
+              {% if ra.confirmation %}onsubmit="return confirm('{{ ra.confirmation }}')"{% endif %}>
+          <input type="hidden" name="action_name" value="{{ ra.name }}"/>
+          <input type="hidden" name="pk" value="{{ item.username if view.identity == 'users' else item.name }}"/>
+          <button type="submit" class="btn btn-sm btn-secondary" title="{{ ra.text }}">
+            <i class="{{ ra.icon_class }}"></i>
+          </button>
+        </form>
+        {% endif %}
+        {% endfor %}
+      </td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+    {% if not items %}
+    <tr><td colspan="{{ view.list_columns | length + 2 }}" style="text-align: center; color: #6f7a91; padding: 24px;">No items found.</td></tr>
+    {% endif %}
+  </tbody>
+</table>
+
+<script>
+  // Batch selection
+  const selectAll = document.getElementById('select-all');
+  const batchBtn = document.getElementById('batch-btn');
+  const batchForm = document.getElementById('batch-form');
+  const checks = document.querySelectorAll('.row-check');
+  function updateBtn() {
+    const any = [...checks].some(c => c.checked);
+    if (batchBtn) batchBtn.disabled = !any;
+  }
+  if (selectAll) {
+    selectAll.addEventListener('change', () => {
+      checks.forEach(c => c.checked = selectAll.checked);
+      updateBtn();
+    });
+  }
+  checks.forEach(c => c.addEventListener('change', updateBtn));
+
+  // Collect checked pks into hidden field before submit
+  if (batchForm) {
+    batchForm.addEventListener('submit', (e) => {
+      const selected = [...checks].filter(c => c.checked).map(c => c.value);
+      let pksInput = batchForm.querySelector('input[name="pks"]');
+      if (!pksInput) {
+        pksInput = document.createElement('input');
+        pksInput.type = 'hidden';
+        pksInput.name = 'pks';
+        batchForm.appendChild(pksInput);
+      }
+      pksInput.value = JSON.stringify(selected);
+      if (selected.length === 0) {
+        e.preventDefault();
+        alert('Please select at least one item.');
+      }
+    });
+  }
+
+  // Client-side search
+  const searchInput = document.createElement('input');
+  searchInput.type = 'text';
+  searchInput.placeholder = 'Search…';
+  searchInput.className = 'search-input';
+  searchInput.style.marginBottom = '12px';
+  searchInput.addEventListener('input', () => {
+    const q = searchInput.value.toLowerCase();
+    document.querySelectorAll('tbody tr').forEach(tr => {
+      tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+  });
+  document.querySelector('.actions-bar').after(searchInput);
+</script>
+{% endblock %}

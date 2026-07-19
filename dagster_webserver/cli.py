@@ -280,6 +280,25 @@ def dagster_webserver(ctx: click.Context, **_kwargs: object):
     default="viewer",
     help="Default role for users when no explicit role is assigned.",
 )
+@click.option(
+    "--enable-admin-portal",
+    is_flag=True,
+    default=False,
+    help=(
+        "Enable the admin portal at /admin. Requires --auth-provider=database "
+        "and --auth-database-url (or --admin-database-url)."
+    ),
+)
+@click.option(
+    "--admin-database-url",
+    type=click.STRING,
+    envvar="DAGSTER_ADMIN_DATABASE_URL",
+    default=None,
+    help=(
+        "SQLAlchemy URL for the admin portal database. Defaults to --auth-database-url "
+        "if not specified."
+    ),
+)
 @workspace_options
 def start(
     host: str,
@@ -302,6 +321,8 @@ def start(
     session_secret: str | None,
     auth_database_url: str | None,
     default_role: str,
+    enable_admin_portal: bool,
+    admin_database_url: str | None,
     **other_opts: object,
 ):
     """Start the Dagster webserver."""
@@ -350,6 +371,14 @@ def start(
             default_role=default_role,
         )
 
+        # -- Build admin portal if requested --
+        admin_portal_instance = _build_admin_portal(
+            enable_admin_portal=enable_admin_portal,
+            auth_provider_instance=auth_provider_instance,
+            auth_database_url=auth_database_url,
+            admin_database_url=admin_database_url,
+        )
+
         with WorkspaceProcessContext(
             instance,
             version=__version__,
@@ -365,6 +394,7 @@ def start(
                 uvicorn_log_level,
                 live_data_poll_rate,
                 auth_provider=auth_provider_instance,
+                admin_portal=admin_portal_instance,
             )
 
 
@@ -389,6 +419,7 @@ def host_dagster_ui_with_workspace_process_context(
     log_level: str,
     live_data_poll_rate: int | None = None,
     auth_provider: object | None = None,
+    admin_portal: object | None = None,
 ):
     check.inst_param(
         workspace_process_context, "workspace_process_context", IWorkspaceProcessContext
@@ -404,12 +435,15 @@ def host_dagster_ui_with_workspace_process_context(
         logger.info(
             "Authentication enabled (provider: %s)", type(auth_provider).__name__
         )
+    if admin_portal is not None:
+        logger.info("Admin portal enabled at /admin")
 
     app = create_app_from_workspace_process_context(
         workspace_process_context,
         path_prefix,
         live_data_poll_rate,
         auth_provider=auth_provider,
+        admin_portal=admin_portal,
         lifespan=_lifespan,
     )
 
@@ -438,6 +472,46 @@ def host_dagster_ui_with_workspace_process_context(
 # ---------------------------------------------------------------------------
 # Auth helper functions
 # ---------------------------------------------------------------------------
+
+
+def _build_admin_portal(
+    enable_admin_portal: bool,
+    auth_provider_instance: object | None,
+    auth_database_url: str | None,
+    admin_database_url: str | None,
+) -> object | None:
+    """Build an AdminPortal instance from CLI options.
+
+    Returns ``None`` when the portal is not enabled.
+    """
+    if not enable_admin_portal:
+        return None
+
+    # Admin portal requires database-backed auth
+    if auth_provider_instance is None:
+        raise click.UsageError(
+            "Admin portal requires authentication. Use --auth-provider=database."
+        )
+
+    # Use admin_database_url if provided, otherwise fall back to auth_database_url
+    db_url = admin_database_url or auth_database_url
+    if not db_url:
+        raise click.UsageError(
+            "Admin portal requires a database URL. Use --auth-database-url "
+            "or --admin-database-url."
+        )
+
+    try:
+        from dagster_webserver.admin.portal import AdminPortal
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+    except ImportError as exc:
+        raise click.UsageError(
+            "Admin portal requires optional dependencies. Install with:\n"
+            "  pip install dagster-webserver[auth]"
+        ) from exc
+
+    backend = DatabaseUserBackend(db_url, create_tables=True)
+    return AdminPortal(backend)
 
 
 def _build_auth_provider(

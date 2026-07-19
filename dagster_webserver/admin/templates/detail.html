@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}{{ view.label }}: {{ pk }} — Dagster Admin{% endblock %}
+{% block content %}
+<div class="actions-bar">
+  <h2 style="flex: 1;">{{ view.label }}: {{ pk }}</h2>
+  <a href="/admin/{{ view.identity }}/list" class="btn btn-secondary">
+    <i class="fas fa-arrow-left"></i> Back to list
+  </a>
+  {% if view.can_edit(request) %}
+  <a href="/admin/{{ view.identity }}/edit/{{ pk }}" class="btn btn-primary">
+    <i class="fas fa-edit"></i> Edit
+  </a>
+  {% endif %}
+</div>
+
+<dl class="detail-grid">
+  {% for field in view.detail_fields %}
+  <dt>{{ field | replace('_', ' ') }}</dt>
+  <dd>
+    {% if field in ('is_active', 'is_builtin') %}
+      <span class="badge badge-{{ obj[field] | lower }}">{{ obj[field] | lower | replace('true', 'Yes') | replace('false', 'No') }}</span>
+    {% elif field == 'permissions' %}
+      <pre style="font-size: 11px; background: #f5f6f8; padding: 8px; border-radius: 4px; max-height: 200px; overflow: auto;">{{ obj[field] | tojson(indent=2) }}</pre>
+    {% else %}
+      {{ obj[field] or '(empty)' }}
+    {% endif %}
+  </dd>
+  {% endfor %}
+</dl>
+
+{% if row_actions %}
+<div style="margin-top: 16px;">
+  {% for ra in row_actions %}
+  {% if not ra.exclude_from_detail %}
+  <form method="post" action="/admin/{{ view.identity }}/row-action" style="display: inline;"
+        {% if ra.confirmation %}onsubmit="return confirm('{{ ra.confirmation }}')"{% endif %}>
+    <input type="hidden" name="action_name" value="{{ ra.name }}"/>
+    <input type="hidden" name="pk" value="{{ pk }}"/>
+    <button type="submit" class="btn btn-sm btn-secondary">
+      <i class="{{ ra.icon_class }}"></i> {{ ra.text }}
+    </button>
+  </form>
+  {% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

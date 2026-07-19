@@ -85,11 +85,14 @@ class TestRoleCRUD:
         with pytest.raises(ValueError, match="not found"):
             await backend.delete_role("nonexistent")
 
-    async def test_delete_role_with_users_raises(self, backend: DatabaseUserBackend):
+    async def test_delete_role_nulls_user_role_id(self, backend: DatabaseUserBackend):
         await backend.create_role("temp", permissions={})
         await backend.create_user("u1", "pass", role="temp")
-        with pytest.raises(ValueError, match="still assigned"):
-            await backend.delete_role("temp")
+        await backend.delete_role("temp")
+        # User should still exist but role_id should be nulled out
+        user = await backend.get_user("u1")
+        assert user is not None
+        assert user.role == "viewer"  # falls back to default when role_id is None
 
 
 # ── User CRUD ───────────────────────────────────────────────────

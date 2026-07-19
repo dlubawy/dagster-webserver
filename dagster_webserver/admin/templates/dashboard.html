@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Dagster Admin — Dashboard{% endblock %}
+{% block content %}
+<h2 style="margin-bottom: 20px;">Dashboard</h2>
+
+<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px;">
+  {% for view in views %}
+  <a href="/admin/{{ view.identity }}/list" style="text-decoration: none;">
+    <div style="background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 1px 3px rgba(3,6,21,.08); border: 1px solid #d2d6de;">
+      <div style="font-size: 24px; margin-bottom: 8px;"><i class="fas fa-{{ view.icon }}" style="color: #4f438d;"></i></div>
+      <div style="font-size: 18px; font-weight: 600; color: #171c2c;">{{ view.plural_label }}</div>
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% endblock %}

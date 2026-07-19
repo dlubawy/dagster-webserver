@@ -298,6 +298,9 @@ async def me_endpoint(request: Request) -> JSONResponse:
     """Return current user info for the UI.
 
     Returns 401 if not authenticated.
+
+    Includes ``hasAnyAdminPermission`` so the UI can decide whether to
+    show the admin portal navigation button.
     """
     user = getattr(request.state, "user", None)
     if not user:
@@ -305,11 +308,22 @@ async def me_endpoint(request: Request) -> JSONResponse:
             {"error": "Not authenticated"},
             status_code=HTTP_401_UNAUTHORIZED,
         )
+
+    # Check if user has ANY admin portal permission
+    auth_provider = getattr(request.app.state, "auth_provider", None)
+    has_any_admin = False
+    if auth_provider:
+        from dagster_webserver.admin.permissions import has_any_admin_permission
+
+        perms = auth_provider.get_user_permissions(user)
+        has_any_admin = has_any_admin_permission(perms)
+
     return JSONResponse(
         {
             "username": user.username,
             "role": user.role,
             "email": user.email,
             "displayName": user.display_name,
+            "hasAnyAdminPermission": has_any_admin,
         }
     )

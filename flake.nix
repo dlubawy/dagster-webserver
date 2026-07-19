@@ -204,7 +204,10 @@
               rev = "${version}";
               hash = "sha256-kIqq5rUoo89yBC2hyAsHZHDxOERSYviODEEpuArsYlY=";
             };
-            patches = [ ./patches/add-logout-button.patch ];
+            patches = [
+              ./patches/add-logout-button.patch
+              ./patches/admin-portal-ui.patch
+            ];
             buildInputs = (
               builtins.attrValues {
                 inherit (pkgs)

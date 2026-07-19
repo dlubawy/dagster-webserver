@@ -318,8 +318,8 @@ class DatabaseUserBackend(UserBackend):
     async def delete_role(self, name: str) -> None:
         """Delete a custom role.
 
-        Raises ``ValueError`` if the role is built-in or still has users
-        assigned.
+        Users still assigned to the role have their role_id nulled out.
+        Raises ``ValueError`` if the role is built-in.
         """
         await self._ensure_ready()
 
@@ -332,21 +332,23 @@ class DatabaseUserBackend(UserBackend):
                 raise ValueError(f"Role '{name}' not found")
             if role.is_builtin:
                 raise ValueError(f"Built-in role '{name}' cannot be deleted")
-            if role.users:
-                raise ValueError(
-                    f"Cannot delete role '{name}': {len(role.users)} user(s) "
-                    "are still assigned to it"
-                )
+            # Null out role_id on any users still assigned to this role
+            for user in role.users:
+                user.role_id = None
             await session.delete(role)
             await session.commit()
 
     async def list_roles(self) -> list[Role]:
         """Return all roles (built-in and custom)."""
+        from sqlalchemy.orm import selectinload
+
         await self._ensure_ready()
 
         async with get_session_factory()() as session:
             result = await session.execute(
-                select(Role).order_by(Role.is_builtin.desc(), Role.name)
+                select(Role)
+                .options(selectinload(Role.users))
+                .order_by(Role.is_builtin.desc(), Role.name)
             )
             return list(result.scalars().all())
 
@@ -393,10 +395,17 @@ class DatabaseUserBackend(UserBackend):
                 display_name=user.display_name,
             )
         else:
+            raw = role.permissions
+            if isinstance(raw, dict):
+                perms = dict(raw)
+            elif isinstance(raw, str):
+                perms = json.loads(raw) if raw else {}
+            else:
+                perms = {}
             return AuthUser(
                 username=user.username,
                 role="custom",
-                custom_permissions=dict(role.permissions),
+                custom_permissions=perms,
                 email=user.email,
                 display_name=user.display_name,
             )

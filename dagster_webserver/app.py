@@ -11,6 +11,7 @@ from starlette.applications import Starlette
 from dagster_webserver.webserver import DagsterWebserver
 
 if TYPE_CHECKING:
+    from dagster_webserver.admin.portal import AdminPortal
     from dagster_webserver.auth.provider import BaseAuthProvider
 
 
@@ -19,6 +20,7 @@ def create_app_from_workspace_process_context(
     path_prefix: str = "",
     live_data_poll_rate: int | None = None,
     auth_provider: BaseAuthProvider | None = None,
+    admin_portal: AdminPortal | None = None,
     **kwargs,
 ) -> Starlette:
     check.inst_param(
@@ -61,6 +63,7 @@ def create_app_from_workspace_process_context(
         path_prefix,
         live_data_poll_rate,
         auth_provider=auth_provider,
+        admin_portal=admin_portal,
     ).create_asgi_app(**kwargs)
 
     # Store auth provider on app state so route handlers can access it

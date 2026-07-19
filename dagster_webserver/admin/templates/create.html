@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Create {{ view.label }} — Dagster Admin{% endblock %}
+{% block content %}
+<div class="actions-bar">
+  <h2 style="flex: 1;">Create {{ view.label }}</h2>
+  <a href="/admin/{{ view.identity }}/list" class="btn btn-secondary">
+    <i class="fas fa-arrow-left"></i> Back to list
+  </a>
+</div>
+
+<form method="post" action="/admin/{{ view.identity }}/create"
+      {% if view.identity == 'roles' %}id="role-form"{% endif %}>
+  {% for field in view.create_fields %}
+  <div class="form-group">
+    <label for="{{ field }}">{{ field | replace('_', ' ') }}</label>
+    {% if field == 'permissions' %}
+    {# Permission checkboxes for roles #}
+    <div class="permissions-grid">
+      {# Permission checkboxes rendered via JS below #}
+    </div>
+    <input type="hidden" name="permissions" id="permissions-input"/>
+    {% elif field == 'password' %}
+    <input type="password" id="{{ field }}" name="{{ field }}" required
+           value="{{ form.get(field, '') if form else '' }}"/>
+    {% elif field == 'role' %}
+    <select id="{{ field }}" name="{{ field }}">
+      {% for role_name in roles %}
+      <option value="{{ role_name }}"
+              {% if (form.get(field, 'viewer') if form else 'viewer') == role_name %}selected{% endif %}>
+        {{ role_name | replace('_', ' ') | title }}
+      </option>
+      {% endfor %}
+    </select>
+    {% else %}
+    <input type="{% if field == 'email' %}email{% else %}text{% endif %}"
+           id="{{ field }}" name="{{ field }}"
+           {% if field == 'username' %}required{% endif %}
+           value="{{ form.get(field, '') if form else '' }}"/>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  <button type="submit" class="btn btn-primary">Create {{ view.label }}</button>
+</form>
+
+{% if view.identity == 'roles' %}
+<script>
+// Populate permission checkboxes for role creation
+const dagsterPermissions = [
+  'launch_pipeline_execution', 'launch_pipeline_reexecution',
+  'start_schedule', 'stop_running_schedule', 'schedule_dry_run',
+  'edit_sensor', 'sensor_dry_run', 'update_sensor_cursor',
+  'terminate_pipeline_execution', 'delete_pipeline_run',
+  'reload_repository_location', 'reload_workspace', 'wipe_assets',
+  'report_runless_asset_events', 'launch_partition_backfill',
+  'cancel_partition_backfill', 'edit_dynamic_partitions',
+  'toggle_auto_materialize', 'edit_concurrency_limit',
+  'edit_app_managed_components'
+];
+const adminPermissions = [
+  'admin_view_users', 'admin_edit_users',
+  'admin_view_roles', 'admin_edit_roles'
+];
+const allPerms = [...dagsterPermissions, ...adminPermissions];
+const grid = document.querySelector('.permissions-grid');
+allPerms.forEach(p => {
+  const label = document.createElement('label');
+  label.className = 'form-check';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.value = p;
+  cb.dataset.perm = p;
+  label.appendChild(cb);
+  label.appendChild(document.createTextNode(p.replace(/_/g, ' ')));
+  grid.appendChild(label);
+});
+document.querySelector('form').addEventListener('submit', () => {
+  const checked = [...grid.querySelectorAll('input:checked')].map(c => c.value);
+  document.getElementById('permissions-input').value = JSON.stringify(Object.fromEntries(checked.map(p => [p, true])));
+});
+</script>
+{% endif %}
+{% endblock %}
