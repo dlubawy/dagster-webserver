@@ -195,19 +195,25 @@
       packages = forEachSupportedSystem (
         { pkgs }:
         let
-          dagster-js-modules = pkgs.stdenv.mkDerivation rec {
+          dagster-js-modules = pkgs.stdenv.mkDerivation (finalAttrs: {
             name = "dagster-js-modules";
             version = "1.13.9";
             src = pkgs.fetchFromGitHub {
               owner = "dagster-io";
               repo = "dagster";
-              rev = "${version}";
+              rev = "${finalAttrs.version}";
               hash = "sha256-kIqq5rUoo89yBC2hyAsHZHDxOERSYviODEEpuArsYlY=";
             };
             patches = [
               ./patches/add-logout-button.patch
               ./patches/admin-portal-ui.patch
             ];
+            missingHashes = ./.missing-hashes.json;
+            offlineCache = pkgs.yarn-berry_4.fetchYarnBerryDeps {
+              inherit (finalAttrs) missingHashes;
+              src = finalAttrs.src + "/js_modules";
+              hash = "sha256-btQahBp8ANrBjxpSKo3cxAfjBw66l7ckzcWZiTXjv/U=";
+            };
             buildInputs = (
               builtins.attrValues {
                 inherit (pkgs)
@@ -215,24 +221,25 @@
                   corepack
                   nodejs
                   uv
+                  writableTmpDirAsHomeHook
                   ;
               }
             );
             buildPhase = ''
               runHook preBuild
+              cache=$(mktemp -d)
+              cp -R ${finalAttrs.offlineCache}/cache/* $cache
+
+              export TMPDIR="$(mktemp -d)"
               pushd js_modules
-
-              mkdir -p .tmp
-              mkdir -p .home
               mkdir -p .corepack
-
-              export TMPDIR="$(pwd)/.tmp"
-              export HOME=$(pwd)/.home
-
               corepack enable --install-directory ./.corepack
-              ./.corepack/yarn install || ./.corepack/yarn install
+              ./.corepack/yarn config set cacheFolder $cache
+              ./.corepack/yarn config set enableOfflineMode true
+              ./.corepack/yarn install
               ./.corepack/yarn workspace @dagster-io/app-oss build
               popd
+
               runHook postBuild
             '';
             installPhase = ''
@@ -241,7 +248,7 @@
               cp -R ./python_modules/dagster-webserver/dagster_webserver/webapp/build "$out/lib/dagster-app-oss"
               runHook postInstall
             '';
-          };
+          });
           pythonSet =
             # Use base package set from pyproject.nix builders
             (pkgs.callPackage pyproject-nix.build.packages {
