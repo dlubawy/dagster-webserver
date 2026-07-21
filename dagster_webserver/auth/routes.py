@@ -178,6 +178,66 @@ body {
   margin-bottom: 16px;
 }
 
+/* ── Divider (between password form and OIDC buttons) ─── */
+.login-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 20px 0;
+  color: var(--text-lighter);
+  font-size: 12px;
+}
+.login-divider hr {
+  flex: 1;
+  border: none;
+  border-top: 1px solid var(--border-default);
+}
+
+/* ── OIDC buttons ──────────────────────────────────────── */
+.login-oidc-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.login-oidc-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 12px;
+  font-size: 14px;
+  font-weight: 500;
+  font-family: inherit;
+  color: var(--text-default);
+  background: var(--bg-input);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  cursor: pointer;
+  text-decoration: none;
+  transition: background .15s, border-color .15s;
+}
+.login-oidc-btn:hover {
+  background: var(--bg-input-hover);
+  border-color: var(--text-lighter);
+}
+.login-oidc-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+.login-oidc-icon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+/* Provider-specific colors */
+.login-oidc-btn--google { border-left: 3px solid #4285F4; }
+.login-oidc-btn--okta { border-left: 3px solid #007DC1; }
+.login-oidc-btn--auth0 { border-left: 3px solid #EB5424; }
+.login-oidc-btn--azure { border-left: 3px solid #0078D4; }
+.login-oidc-btn--keycloak { border-left: 3px solid #4A90D9; }
+
 /* ── Footer ───────────────────────────────────────────── */
 .login-footer {
   margin-top: 24px;
@@ -210,6 +270,7 @@ body {
     </div>
     <button class="login-submit" type="submit">Sign in</button>
   </form>
+  {oidc_buttons}
   <div class="login-footer">
     <a href="https://docs.dagster.io" target="_blank" rel="noopener">Documentation</a>
   </div>
@@ -219,13 +280,70 @@ body {
 """
 
 
-def _render_login(error: str | None = None) -> str:
-    """Render the login HTML template, optionally with an error banner."""
+def _render_login(
+    error: str | None = None,
+    oidc_providers: list[object] | None = None,
+) -> str:
+    """Render the login HTML template, optionally with an error banner
+    and OIDC provider buttons."""
     if error:
         error_html = f'<div class="login-error">{error}</div>'
     else:
         error_html = ""
-    return _LOGIN_TEMPLATE.replace("{error_banner}", error_html)
+
+    # Build OIDC buttons HTML
+    oidc_html = ""
+    if oidc_providers:
+        buttons = []
+        for p in oidc_providers:
+            display_name = getattr(p, "display_name", "OIDC")
+            name = getattr(p, "name", "generic")
+            icon_svg = _get_oidc_icon_svg(name)
+            buttons.append(
+                f'<a href="/oidc/authorize/{name}" '
+                f'class="login-oidc-btn login-oidc-btn--{name}" '
+                f'title="Sign in with {display_name}"> '
+                f"{icon_svg} "
+                f"<span>Sign in with {display_name}</span>"
+                "</a>"
+            )
+        if buttons:
+            oidc_html = (
+                '<div class="login-divider"><hr/><span>Or sign in with</span><hr/></div>'
+                f'<div class="login-oidc-buttons">{"".join(buttons)}</div>'
+            )
+
+    return _LOGIN_TEMPLATE.replace("{error_banner}", error_html).replace(
+        "{oidc_buttons}", oidc_html
+    )
+
+
+def _get_oidc_icon_svg(provider_name: str) -> str:
+    """Return an inline SVG icon for a known OIDC provider.
+
+    Falls back to a generic shield icon for unknown providers.
+    """
+    icons: dict[str, str] = {
+        "google": (
+            '<svg class="login-oidc-icon" viewBox="0 0 48 48">'
+            '<path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.97 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.22C12.43 13.72 17.74 9.5 24 9.5z"/>'
+            '<path fill="#4285F4" d="M46.98 24.55c0-1.65-.15-3.16-.42-4.55H24v9h12.74c-.55 2.93-2.3 5.38-4.93 6.98l7.62 5.94c4.46-3.97 7.05-9.83 7.05-17.41z"/>'
+            '<path fill="#FBBC05" d="M10.53 28.57c-.48-1.45-.76-2.99-.76-4.57s.28-3.12.76-4.57l-7.98-6.22C.92 16.45 0 20.12 0 24s.92 7.55 2.56 10.78l7.97-6.21z"/>'
+            '<path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.62-5.94c-2.11 1.42-4.76 2.25-8.27 2.25-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.22C6.51 42.62 14.62 48 24 48z"/>'
+            "</svg>"
+        ),
+        "okta": (
+            '<svg class="login-oidc-icon" viewBox="0 0 24 24" fill="none">'
+            '<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" fill="#007DC1"/>'
+            '<path d="M12 6c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6z" fill="white"/>'
+            '<path d="M12 9c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z" fill="#007DC1"/>'
+            "</svg>"
+        ),
+    }
+    return icons.get(
+        provider_name,
+        '<svg class="login-oidc-icon" viewBox="0 0 24 24" fill="none"><path d="M12 2L3 7v5c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z" fill="var(--text-lighter)"/></svg>',
+    )
 
 
 def _get_provider(request: Request) -> object:
@@ -242,7 +360,10 @@ async def login_endpoint(
     if request.method == "GET":
         # GET — render the login form (or return 401 for API clients)
         if "text/html" in request.headers.get("Accept", ""):
-            return HTMLResponse(_render_login())
+            oidc_providers = []
+            if hasattr(provider, "get_oidc_providers"):
+                oidc_providers = await provider.get_oidc_providers()
+            return HTMLResponse(_render_login(oidc_providers=oidc_providers))
         return JSONResponse(
             {"error": "Authentication required"},
             status_code=HTTP_401_UNAUTHORIZED,
@@ -264,8 +385,13 @@ async def login_endpoint(
 
     if not user:
         if "text/html" in request.headers.get("Accept", ""):
+            oidc_providers = []
+            if hasattr(provider, "get_oidc_providers"):
+                oidc_providers = await provider.get_oidc_providers()
             return HTMLResponse(
-                _render_login("Invalid username or password"),
+                _render_login(
+                    "Invalid username or password", oidc_providers=oidc_providers
+                ),
                 status_code=HTTP_400_BAD_REQUEST,
             )
         return JSONResponse(

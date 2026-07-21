@@ -33,6 +33,7 @@ artifacts = ["dagster_webserver/webapp/build/"]
 notebook = ["nbconvert"]  # notebooks support
 auth = ["pyyaml", "argon2-cffi", "aiosqlite", "greenlet"]  # YAML user file support + argon2id password hashing + async SQLite
 auth-db = ["asyncpg"]  # Async PostgreSQL driver for production
+auth-oidc = ["joserfc>=0.11.0", "httpx>=0.27.0"]  # OIDC login support
 
 [dependency-groups]
 test = [

@@ -29,7 +29,12 @@ from starlette.status import HTTP_403_FORBIDDEN as HTTP_403
 from starlette.templating import Jinja2Templates
 
 from dagster_webserver.admin.permissions import has_any_admin_permission
-from dagster_webserver.admin.views import BaseAdminView, RoleView, UserView
+from dagster_webserver.admin.views import (
+    BaseAdminView,
+    OIDCProviderView,
+    RoleView,
+    UserView,
+)
 
 if TYPE_CHECKING:
     from dagster_webserver.auth.db_backend import DatabaseUserBackend
@@ -120,6 +125,7 @@ class AdminPortal:
         self._views = [
             UserView(self.backend),
             RoleView(self.backend),
+            OIDCProviderView(self.backend),
         ]
 
     def _find_view(self, identity: str) -> BaseAdminView:

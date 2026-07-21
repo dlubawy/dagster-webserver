@@ -67,6 +67,9 @@ def _admin_permissions_for_role(role: Role) -> dict[str, PermissionResult]:
             AdminPermission.ADMIN_EDIT_ROLES.value: PermissionResult(
                 enabled=True, disabled_reason=None
             ),
+            AdminPermission.ADMIN_EDIT_OIDC.value: PermissionResult(
+                enabled=True, disabled_reason=None
+            ),
         }
     return {
         AdminPermission.ADMIN_VIEW_USERS.value: PermissionResult(
@@ -84,6 +87,14 @@ def _admin_permissions_for_role(role: Role) -> dict[str, PermissionResult]:
         AdminPermission.ADMIN_EDIT_ROLES.value: PermissionResult(
             enabled=False,
             disabled_reason=f"Role {role.value} missing admin_edit_roles permission",
+        ),
+        AdminPermission.ADMIN_VIEW_OIDC.value: PermissionResult(
+            enabled=False,
+            disabled_reason=f"Role {role.value} missing admin_view_oidc permission",
+        ),
+        AdminPermission.ADMIN_EDIT_OIDC.value: PermissionResult(
+            enabled=False,
+            disabled_reason=f"Role {role.value} missing admin_edit_oidc permission",
         ),
     }
 

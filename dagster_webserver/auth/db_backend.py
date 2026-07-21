@@ -21,6 +21,7 @@ from dagster_webserver.auth.users import (
     _verify_password,
 )
 from dagster_webserver.database import (
+    OIDCProvider,
     Role,
     User,
     get_engine,
@@ -217,6 +218,11 @@ class DatabaseUserBackend(UserBackend):
                 raise ValueError(f"User '{username}' not found")
 
             if password is not None:
+                if user.oidc_sub is not None:
+                    raise ValueError(
+                        f"User '{username}' is linked to an OIDC provider. "
+                        "Password cannot be set for OIDC users."
+                    )
                 user.password_hash = _hash_password(password)
 
             if role is not None:
@@ -384,6 +390,7 @@ class DatabaseUserBackend(UserBackend):
                     custom_permissions=None,
                     email=user.email,
                     display_name=user.display_name,
+                    oidc_sub=user.oidc_sub,
                 )
 
         if role.is_builtin:
@@ -393,6 +400,7 @@ class DatabaseUserBackend(UserBackend):
                 custom_permissions=None,
                 email=user.email,
                 display_name=user.display_name,
+                oidc_sub=user.oidc_sub,
             )
         else:
             raw = role.permissions
@@ -408,6 +416,7 @@ class DatabaseUserBackend(UserBackend):
                 custom_permissions=perms,
                 email=user.email,
                 display_name=user.display_name,
+                oidc_sub=user.oidc_sub,
             )
 
     async def _lookup_role(self, name: str, *, session: Any = None) -> Role:
@@ -435,3 +444,260 @@ class DatabaseUserBackend(UserBackend):
                 select(Role).where(Role.name == self._default_role_name)
             )
             self._default_role = result.scalar_one_or_none()
+
+    # ── OIDC Provider CRUD ───────────────────────────────────────
+
+    async def list_oidc_providers(
+        self, *, enabled_only: bool = False
+    ) -> list[OIDCProvider]:
+        """Return OIDC providers ordered by display_order.
+
+        If *enabled_only* is ``True``, filters to enabled providers.
+        """
+        from sqlalchemy.orm import selectinload
+
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            stmt = (
+                select(OIDCProvider)
+                .options(selectinload(OIDCProvider.users))
+                .order_by(OIDCProvider.display_order, OIDCProvider.name)
+            )
+            if enabled_only:
+                stmt = stmt.where(OIDCProvider.enabled.is_(True))
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def get_oidc_provider(self, name: str) -> OIDCProvider | None:
+        """Look up an OIDC provider by name."""
+        from sqlalchemy.orm import selectinload
+
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(OIDCProvider)
+                .options(selectinload(OIDCProvider.users))
+                .where(OIDCProvider.name == name)
+            )
+            return result.scalar_one_or_none()
+
+    async def get_oidc_provider_by_id(self, provider_id: int) -> OIDCProvider | None:
+        """Look up an OIDC provider by ID."""
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(OIDCProvider).where(OIDCProvider.id == provider_id)
+            )
+            return result.scalar_one_or_none()
+
+    async def create_oidc_provider(
+        self,
+        name: str,
+        display_name: str,
+        issuer_url: str,
+        client_id: str,
+        client_secret: str,
+        *,
+        scopes: str = "openid email profile",
+        display_order: int = 0,
+    ) -> OIDCProvider:
+        """Create a new OIDC provider.
+
+        Raises ``IntegrityError`` if a provider with this name already exists.
+        """
+        await self._ensure_ready()
+
+        provider = OIDCProvider(
+            name=name,
+            display_name=display_name,
+            issuer_url=issuer_url,
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=scopes,
+            enabled=True,
+            display_order=display_order,
+        )
+        async with get_session_factory()() as session:
+            session.add(provider)
+            await session.commit()
+            await session.refresh(provider)
+            return provider
+
+    async def update_oidc_provider(
+        self,
+        name: str,
+        *,
+        display_name: str | None = None,
+        issuer_url: str | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+        scopes: str | None = None,
+        enabled: bool | None = None,
+        display_order: int | None = None,
+    ) -> OIDCProvider:
+        """Update an OIDC provider.
+
+        Raises ``ValueError`` if not found.
+        """
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(OIDCProvider).where(OIDCProvider.name == name)
+            )
+            provider = result.scalar_one_or_none()
+            if provider is None:
+                raise ValueError(f"OIDC provider '{name}' not found")
+
+            if display_name is not None:
+                provider.display_name = display_name
+            if issuer_url is not None:
+                provider.issuer_url = issuer_url
+            if client_id is not None:
+                provider.client_id = client_id
+            if client_secret is not None:
+                provider.client_secret = client_secret
+            if scopes is not None:
+                provider.scopes = scopes
+            if enabled is not None:
+                provider.enabled = enabled
+            if display_order is not None:
+                provider.display_order = display_order
+
+            await session.commit()
+            await session.refresh(provider)
+            return provider
+
+    async def delete_oidc_provider(self, name: str) -> None:
+        """Delete an OIDC provider.
+
+        Nulls out ``oidc_provider_id`` on any linked users.
+        Raises ``ValueError`` if not found.
+        """
+        from sqlalchemy.orm import selectinload
+
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(OIDCProvider)
+                .options(selectinload(OIDCProvider.users))
+                .where(OIDCProvider.name == name)
+            )
+            provider = result.unique().scalar_one_or_none()
+            if provider is None:
+                raise ValueError(f"OIDC provider '{name}' not found")
+            # Null out oidc_provider_id on any linked users
+            for user in provider.users:
+                user.oidc_provider_id = None
+                user.oidc_sub = None
+            await session.delete(provider)
+            await session.commit()
+
+    # ── OIDC User Lookup & Creation ──────────────────────────────
+
+    async def get_user_by_oidc(
+        self, provider_id: int, oidc_sub: str
+    ) -> AuthUser | None:
+        """Look up a user by OIDC provider ID and subject identifier."""
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(User)
+                .options(joinedload(User.role))
+                .where(
+                    User.oidc_provider_id == provider_id,
+                    User.oidc_sub == oidc_sub,
+                )
+            )
+            user = result.scalar_one_or_none()
+            if user and user.is_active:
+                return self._to_auth_user(user)
+            return None
+
+    async def get_user_by_email(self, email: str) -> AuthUser | None:
+        """Look up a user by email address."""
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(User).options(joinedload(User.role)).where(User.email == email)
+            )
+            user = result.scalar_one_or_none()
+            if user and user.is_active:
+                return self._to_auth_user(user)
+            return None
+
+    async def create_oidc_user(
+        self,
+        username: str,
+        provider_id: int,
+        oidc_sub: str,
+        *,
+        email: str | None = None,
+        display_name: str | None = None,
+        role: str = "viewer",
+    ) -> AuthUser:
+        """Create a new user linked to an OIDC provider.
+
+        ``password_hash`` is set to empty string — OIDC users authenticate
+        only via OIDC.
+
+        Raises ``ValueError`` if the role is unknown.
+        """
+        await self._ensure_ready()
+
+        role_obj = await self._lookup_role(role)
+
+        user = User(
+            username=username,
+            password_hash="",
+            role_id=role_obj.id,
+            email=email,
+            display_name=display_name,
+            is_active=True,
+            oidc_provider_id=provider_id,
+            oidc_sub=oidc_sub,
+        )
+
+        async with get_session_factory()() as session:
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+            if user.role_id is not None:
+                result = await session.execute(
+                    select(Role).where(Role.id == user.role_id)
+                )
+                user.role = result.scalar_one_or_none()
+            return self._to_auth_user(user)
+
+    async def link_oidc_to_user(
+        self, username: str, provider_id: int, oidc_sub: str
+    ) -> AuthUser:
+        """Link an OIDC identity to an existing user.
+
+        Raises ``ValueError`` if the user is not found.
+        """
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(User)
+                .options(joinedload(User.role))
+                .where(User.username == username)
+            )
+            user = result.scalar_one_or_none()
+            if user is None:
+                raise ValueError(f"User '{username}' not found")
+            user.oidc_provider_id = provider_id
+            user.oidc_sub = oidc_sub
+            await session.commit()
+            await session.refresh(user)
+            if user.role_id is not None:
+                r = await session.execute(select(Role).where(Role.id == user.role_id))
+                user.role = r.scalar_one_or_none()
+            return self._to_auth_user(user)

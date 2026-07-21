@@ -20,10 +20,11 @@ from dagster_webserver.database.engine import (
     get_session_factory,
     init_engine,
 )
-from dagster_webserver.database.models import Base, Role, User
+from dagster_webserver.database.models import Base, OIDCProvider, Role, User
 
 __all__ = [
     "Base",
+    "OIDCProvider",
     "Role",
     "User",
     "init_engine",

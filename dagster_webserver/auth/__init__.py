@@ -49,6 +49,7 @@ from dagster_webserver.auth.provider import (
     ApiKeyAuthProvider,
     AuthConfig,
     BaseAuthProvider,
+    HybridSessionAuthProvider,
     SessionAuthProvider,
 )
 from dagster_webserver.auth.roles import (
@@ -79,6 +80,7 @@ __all__ = [
     "AuthConfig",
     "BaseAuthProvider",
     "SessionAuthProvider",
+    "HybridSessionAuthProvider",
     "ApiKeyAuthProvider",
     # Middleware
     "AuthMiddleware",

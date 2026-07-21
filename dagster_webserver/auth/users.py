@@ -40,6 +40,8 @@ class AuthUser:
         custom_permissions: Explicit permission map for custom roles.
         email: Optional email address.
         display_name: Optional human-readable name.
+        oidc_sub: OIDC subject identifier if the user is linked to an OIDC
+            provider. ``None`` for password-only users.
     """
 
     username: str
@@ -47,6 +49,7 @@ class AuthUser:
     custom_permissions: dict[str, bool] | None = None
     email: str | None = None
     display_name: str | None = None
+    oidc_sub: str | None = None
 
 
 class UserBackend(ABC):

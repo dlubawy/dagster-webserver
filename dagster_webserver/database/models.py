@@ -46,6 +46,32 @@ class Role(Base):
     users: Mapped[list["User"]] = relationship("User", back_populates="role")
 
 
+class OIDCProvider(Base):
+    __tablename__ = "oidc_providers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    issuer_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    client_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    client_secret: Mapped[str] = mapped_column(String(1024), nullable=False)
+    scopes: Mapped[str] = mapped_column(
+        String(512),
+        default="openid email profile",
+        server_default="openid email profile",
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    display_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    users: Mapped[list["User"]] = relationship("User", back_populates="oidc_provider")
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -65,4 +91,13 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
+    # OIDC linkage
+    oidc_provider_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("oidc_providers.id"), nullable=True
+    )
+    oidc_sub: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
     role: Mapped["Role | None"] = relationship("Role", back_populates="users")
+    oidc_provider: Mapped["OIDCProvider | None"] = relationship(
+        "OIDCProvider", back_populates="users"
+    )

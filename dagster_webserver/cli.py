@@ -236,13 +236,16 @@ def dagster_webserver(ctx: click.Context, **_kwargs: object):
 # -- Auth options --
 @click.option(
     "--auth-provider",
-    type=click.Choice(["session", "api-key", "database", "none"], case_sensitive=False),
+    type=click.Choice(
+        ["session", "api-key", "database", "hybrid", "none"], case_sensitive=False
+    ),
     default="none",
     help=(
         "Authentication provider to use. "
         "'session' uses cookie-based sessions with username/password. "
         "'api-key' uses Bearer token auth. "
         "'database' uses cookie-based sessions backed by a database. "
+        "'hybrid' uses cookie-based sessions backed by a database with OIDC support. "
         "'none' disables auth (default)."
     ),
 )
@@ -490,7 +493,8 @@ def _build_admin_portal(
     # Admin portal requires database-backed auth
     if auth_provider_instance is None:
         raise click.UsageError(
-            "Admin portal requires authentication. Use --auth-provider=database."
+            "Admin portal requires authentication. Use --auth-provider=database "
+            "or --auth-provider=hybrid."
         )
 
     # Use admin_database_url if provided, otherwise fall back to auth_database_url
@@ -570,6 +574,41 @@ def _build_auth_provider(
             default_role=default_role,
         )
         return SessionAuthProvider(user_backend, config=config)
+
+    # Handle hybrid (database + OIDC) auth
+    if auth_provider == "hybrid":
+        if not auth_database_url:
+            raise click.BadParameter(
+                "--auth-database-url is required when --auth-provider=hybrid",
+                param_hint="--auth-database-url",
+            )
+        try:
+            from dagster_webserver.auth.db_backend import DatabaseUserBackend
+            from dagster_webserver.auth.provider import HybridSessionAuthProvider
+        except ImportError as exc:
+            raise click.UsageError(
+                "Hybrid auth requires optional dependencies. Install with:\n"
+                "  pip install dagster-webserver[auth-oidc]"
+            ) from exc
+
+        if not session_secret:
+            import secrets
+
+            session_secret = secrets.token_hex(32)
+            logging.getLogger(WEBSERVER_LOGGER_NAME).warning(
+                "No --session-secret provided. A random secret was generated. "
+                "Set DAGSTER_WEBSERVER_SESSION_SECRET or use --session-secret for persistence."
+            )
+        config._session_secret = session_secret  # type: ignore[attr-defined]
+        config.allowed_routes = list(config.allowed_routes) + [
+            "oidc-authorize",
+            "oidc-callback",
+        ]
+        user_backend = DatabaseUserBackend(
+            auth_database_url,
+            default_role=default_role,
+        )
+        return HybridSessionAuthProvider(user_backend, config=config)
 
     # Build user backend from --users-file
     if users_file:
@@ -774,6 +813,175 @@ def db_delete_role(name: str, database_url: str) -> None:
     finally:
         loop.close()
     click.echo(f"Role '{name}' deleted successfully.")
+
+
+# ---------------------------------------------------------------------------
+# Alembic migration commands
+# ---------------------------------------------------------------------------
+
+
+def _get_alembic_config(database_url: str):
+    """Build an Alembic Config pointing at the auth database."""
+    import os
+
+    from alembic.config import Config
+
+    # Locate the alembic directory shipped with the package
+    alembic_dir = os.path.join(os.path.dirname(__file__), "database", "alembic")
+    alembic_ini = os.path.join(alembic_dir, "alembic.ini")
+    config = Config(alembic_ini)
+    config.set_main_option("sqlalchemy.url", database_url)
+    # Ensure script_location is absolute so Alembic finds env.py
+    config.set_main_option("script_location", alembic_dir)
+    return config
+
+
+@db_cli.command(
+    name="migrate",
+    help="Run all pending database migrations (alias for upgrade head).",
+)
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_migrate(database_url: str) -> None:
+    """Upgrade the database to the latest revision."""
+    config = _get_alembic_config(database_url)
+    from alembic.command import upgrade
+
+    upgrade(config, "head")
+    click.echo("Database migrated to head successfully.")
+
+
+@db_cli.command(name="upgrade", help="Upgrade the database to a specific revision.")
+@click.option(
+    "--revision",
+    "-r",
+    required=True,
+    help="Target revision (e.g. 'head', '001', '-1').",
+)
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_upgrade(database_url: str, revision: str) -> None:
+    """Upgrade the database to a specific revision (e.g. 'head', '001', '-1')."""
+    config = _get_alembic_config(database_url)
+    from alembic.command import upgrade
+
+    upgrade(config, revision)
+    click.echo(f"Database upgraded to revision '{revision}'.")
+
+
+@db_cli.command(name="downgrade", help="Downgrade the database to a specific revision.")
+@click.option(
+    "--revision",
+    "-r",
+    required=True,
+    help="Target revision (e.g. '001', '-1', 'base').",
+)
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_downgrade(database_url: str, revision: str) -> None:
+    """Downgrade the database to a specific revision (e.g. '001', '-1', 'base')."""
+    config = _get_alembic_config(database_url)
+    from alembic.command import downgrade
+
+    downgrade(config, revision)
+    click.echo(f"Database downgraded to revision '{revision}'.")
+
+
+@db_cli.command(name="current", help="Show the current revision for the database.")
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_current(database_url: str) -> None:
+    """Show the current revision for the database."""
+    config = _get_alembic_config(database_url)
+    from alembic.command import current
+
+    current(config, verbose=True)
+
+
+@db_cli.command(name="history", help="List all available migration revisions.")
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_history(database_url: str) -> None:
+    """List all available migration revisions."""
+    config = _get_alembic_config(database_url)
+    from alembic.command import history
+
+    history(config, verbose=True)
+
+
+@db_cli.command(
+    name="stamp", help="Stamp the database with a revision without running migrations."
+)
+@click.option(
+    "--revision",
+    "-r",
+    required=True,
+    help="Target revision (e.g. 'head', '001', 'base').",
+)
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_stamp(database_url: str, revision: str) -> None:
+    """Stamp the database with a revision without running migrations (e.g. 'head', '001')."""
+    config = _get_alembic_config(database_url)
+    from alembic.command import stamp
+
+    stamp(config, revision)
+    click.echo(f"Database stamped with revision '{revision}'.")
+
+
+@db_cli.command(
+    name="check",
+    help="Check if the database is at the latest revision.",
+)
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_check(database_url: str) -> None:
+    """Check if the database schema is up to date."""
+    import sys
+
+    from alembic.command import check
+    from alembic.util import AutogenerateDiffsDetected
+
+    config = _get_alembic_config(database_url)
+    try:
+        check(config)
+        click.echo("Database schema is up to date.")
+    except AutogenerateDiffsDetected:
+        click.echo(
+            "Schema differences detected. Run 'alembic revision --autogenerate -m "
+            "\"<message>\"' to generate a migration, or run 'dagster-webserver db migrate' "
+            "to apply pending migrations.",
+            err=True,
+        )
+        sys.exit(1)
 
 
 cli = create_dagster_webserver_cli()

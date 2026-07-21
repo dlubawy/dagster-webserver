@@ -148,9 +148,11 @@ class TestAdminPermissionEnum:
         assert AdminPermission.ADMIN_EDIT_USERS.value == "admin_edit_users"
         assert AdminPermission.ADMIN_VIEW_ROLES.value == "admin_view_roles"
         assert AdminPermission.ADMIN_EDIT_ROLES.value == "admin_edit_roles"
+        assert AdminPermission.ADMIN_VIEW_OIDC.value == "admin_view_oidc"
+        assert AdminPermission.ADMIN_EDIT_OIDC.value == "admin_edit_oidc"
 
     def test_enum_count(self):
-        assert len(AdminPermission) == 4
+        assert len(AdminPermission) == 6
 
 
 # ---------------------------------------------------------------------------

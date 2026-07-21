@@ -22,8 +22,10 @@ from starlette.responses import RedirectResponse, Response
 from starlette.status import HTTP_302_FOUND
 
 from dagster_webserver.admin.permissions import (
+    can_edit_oidc,
     can_edit_roles,
     can_edit_users,
+    can_view_oidc,
     can_view_roles,
     can_view_users,
     has_any_admin_permission,
@@ -409,12 +411,20 @@ class UserView(BaseAdminView):
             "email": obj.email or "",
             "role": obj.role,
             "is_active": True,  # list_users only returns active users
+            "oidc_sub": obj.oidc_sub,
             "created_at": "",
             "updated_at": "",
         }
 
     async def get_pk(self, obj: AuthUser) -> str:
         return obj.username
+
+    async def is_row_action_allowed(self, request: Request, name: str) -> bool:
+        if name == "reset_password":
+            # Reset password is only allowed for non-OIDC users
+            # We need to check the actual user to see if they have an OIDC sub
+            return self.can_edit(request)
+        return await super().is_row_action_allowed(request, name)
 
     # -- Row actions --
 
@@ -615,6 +625,213 @@ class RoleView(BaseAdminView):
     async def delete_action(self, request: Request, pks: list[str]) -> str:
         count = await self.delete(request, pks)
         return f"{count} role(s) were successfully deleted"
+
+
+# ---------------------------------------------------------------------------
+# OIDCProviderView
+# ---------------------------------------------------------------------------
+
+
+def _mask_secret(secret: str) -> str:
+    """Mask a client secret for display, showing only last 4 characters."""
+    if not secret or len(secret) < 4:
+        return "••••••••"
+    return "••••••••" + secret[-4:]
+
+
+class OIDCProviderView(BaseAdminView):
+    identity = "oidc"
+    label = "OIDC Provider"
+    plural_label = "OIDC Providers"
+    icon = "shield-alt"
+
+    list_columns = [
+        "display_name",
+        "issuer_url",
+        "user_count",
+        "enabled",
+        "display_order",
+        "created_at",
+    ]
+    detail_fields = [
+        "name",
+        "display_name",
+        "issuer_url",
+        "client_id",
+        "client_secret",
+        "scopes",
+        "enabled",
+        "display_order",
+        "user_count",
+    ]
+    create_fields = [
+        "name",
+        "display_name",
+        "issuer_url",
+        "client_id",
+        "client_secret",
+        "scopes",
+        "display_order",
+    ]
+    edit_fields = [
+        "display_name",
+        "issuer_url",
+        "client_id",
+        "client_secret",
+        "scopes",
+        "enabled",
+        "display_order",
+    ]
+
+    def is_accessible(self, request: Request) -> bool:
+        return can_view_oidc(_get_admin_perms(request))
+
+    def can_create(self, request: Request) -> bool:
+        return can_edit_oidc(_get_admin_perms(request))
+
+    def can_edit(self, request: Request) -> bool:
+        return can_edit_oidc(_get_admin_perms(request))
+
+    def can_delete(self, request: Request) -> bool:
+        return can_edit_oidc(_get_admin_perms(request))
+
+    # -- CRUD --
+
+    async def find_all(
+        self,
+        request: Request,
+        skip: int = 0,
+        limit: int = 100,
+        where: dict[str, Any] | None = None,
+        order_by: list[str] | None = None,
+    ) -> list[Any]:
+        providers = await self._backend.list_oidc_providers()
+        return providers[skip : skip + limit]
+
+    async def count(self, request: Request, where: dict[str, Any] | None = None) -> int:
+        providers = await self._backend.list_oidc_providers()
+        return len(providers)
+
+    async def find_by_pk(self, request: Request, pk: str) -> Any:
+        return await self._backend.get_oidc_provider(pk)
+
+    async def create(self, request: Request, data: dict[str, Any]) -> Any:
+        name = data["name"].strip()
+        existing = await self._backend.get_oidc_provider(name)
+        if existing is not None:
+            raise ValueError(f"OIDC provider '{name}' already exists")
+        return await self._backend.create_oidc_provider(
+            name=name,
+            display_name=data["display_name"].strip(),
+            issuer_url=data["issuer_url"].strip(),
+            client_id=data["client_id"].strip(),
+            client_secret=data["client_secret"].strip(),
+            scopes=data.get("scopes", "openid email profile").strip(),
+            display_order=int(data.get("display_order", 0)),
+        )
+
+    async def edit(self, request: Request, pk: str, data: dict[str, Any]) -> Any:
+        kwargs: dict[str, Any] = {}
+        if "display_name" in data and data["display_name"]:
+            kwargs["display_name"] = data["display_name"].strip()
+        if "issuer_url" in data and data["issuer_url"]:
+            kwargs["issuer_url"] = data["issuer_url"].strip()
+        if "client_id" in data and data["client_id"]:
+            kwargs["client_id"] = data["client_id"].strip()
+        # Only update client_secret if a non-empty value is provided
+        if "client_secret" in data and data["client_secret"]:
+            kwargs["client_secret"] = data["client_secret"].strip()
+        if "scopes" in data:
+            kwargs["scopes"] = data["scopes"].strip()
+        if "enabled" in data:
+            kwargs["enabled"] = data["enabled"] in ("true", "True", "on", True, "1")
+        if "display_order" in data:
+            kwargs["display_order"] = int(data["display_order"])
+        return await self._backend.update_oidc_provider(pk, **kwargs)
+
+    async def delete(self, request: Request, pks: list[str]) -> int:
+        for name in pks:
+            await self._backend.delete_oidc_provider(name)
+        return len(pks)
+
+    # -- Serialization --
+
+    async def serialize(
+        self, obj: Any, request: Request, action: str = "list"
+    ) -> dict[str, Any]:
+        # user_count: check __dict__ directly to avoid triggering a lazy-load
+        # on a detached ORM object.
+        user_count = 0
+        users_rel = obj.__dict__.get("users")
+        if users_rel is not None:
+            try:
+                user_count = len(users_rel)
+            except Exception:
+                pass
+
+        result = {
+            "name": obj.name,
+            "display_name": obj.display_name,
+            "issuer_url": obj.issuer_url,
+            "client_id": obj.client_id,
+            "client_secret": _mask_secret(obj.client_secret),
+            "scopes": obj.scopes,
+            "enabled": obj.enabled,
+            "display_order": obj.display_order,
+            "user_count": user_count,
+            "created_at": (obj.created_at.isoformat() if obj.created_at else ""),
+            "updated_at": (obj.updated_at.isoformat() if obj.updated_at else ""),
+        }
+        # In edit mode, don't mask the secret so the form can show a placeholder
+        if action == "edit":
+            result["client_secret"] = ""  # Empty = keep current value
+        return result
+
+    async def get_pk(self, obj: Any) -> str:
+        return obj.name
+
+    # -- Row actions --
+
+    @row_action(
+        name="view", text="View", icon_class="fas fa-eye", exclude_from_detail=True
+    )
+    async def view_action(self, request: Request, pk: str) -> Response:
+        route_name = request.app.state.ROUTE_NAME
+        url = str(
+            request.url_for(route_name + ":admin-detail", identity=self.identity, pk=pk)
+        )
+        return RedirectResponse(url, status_code=HTTP_302_FOUND)
+
+    @row_action(name="edit", text="Edit", icon_class="fas fa-edit")
+    async def edit_action(self, request: Request, pk: str) -> Response:
+        route_name = request.app.state.ROUTE_NAME
+        url = str(
+            request.url_for(route_name + ":admin-edit", identity=self.identity, pk=pk)
+        )
+        return RedirectResponse(url, status_code=HTTP_302_FOUND)
+
+    @row_action(
+        name="delete",
+        text="Delete",
+        confirmation="Are you sure you want to delete this OIDC provider?",
+        icon_class="fas fa-trash",
+    )
+    async def delete_row_action(self, request: Request, pk: str) -> str:
+        await self.delete(request, [pk])
+        return "OIDC provider was successfully deleted"
+
+    # -- Batch actions --
+
+    @action(
+        name="delete",
+        text="Delete selected",
+        confirmation="Are you sure you want to delete the selected OIDC providers?",
+        submit_btn_class="btn-danger",
+        submit_btn_text="Yes, delete",
+    )
+    async def delete_action(self, request: Request, pks: list[str]) -> str:
+        count = await self.delete(request, pks)
+        return f"{count} OIDC provider(s) were successfully deleted"
 
 
 # ---------------------------------------------------------------------------

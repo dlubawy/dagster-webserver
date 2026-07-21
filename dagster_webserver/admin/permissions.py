@@ -33,6 +33,9 @@ class AdminPermission(str, Enum):
     ADMIN_VIEW_ROLES = "admin_view_roles"
     ADMIN_EDIT_ROLES = "admin_edit_roles"  # implies ADMIN_VIEW_ROLES
 
+    ADMIN_VIEW_OIDC = "admin_view_oidc"
+    ADMIN_EDIT_OIDC = "admin_edit_oidc"  # implies ADMIN_VIEW_OIDC
+
 
 # ---------------------------------------------------------------------------
 # Internal helper
@@ -79,6 +82,23 @@ def can_view_roles(perms: dict[str, PermissionResult]) -> bool:
 def can_edit_roles(perms: dict[str, PermissionResult]) -> bool:
     """Can the user create / edit / delete roles?"""
     return _has(perms, AdminPermission.ADMIN_EDIT_ROLES.value)
+
+
+# ---------------------------------------------------------------------------
+# OIDC permissions
+# ---------------------------------------------------------------------------
+
+
+def can_view_oidc(perms: dict[str, PermissionResult]) -> bool:
+    """Can the user view OIDC providers?  EDIT implies VIEW."""
+    return _has(perms, AdminPermission.ADMIN_EDIT_OIDC.value) or _has(
+        perms, AdminPermission.ADMIN_VIEW_OIDC.value
+    )
+
+
+def can_edit_oidc(perms: dict[str, PermissionResult]) -> bool:
+    """Can the user create / edit / delete OIDC providers?"""
+    return _has(perms, AdminPermission.ADMIN_EDIT_OIDC.value)
 
 
 # ---------------------------------------------------------------------------

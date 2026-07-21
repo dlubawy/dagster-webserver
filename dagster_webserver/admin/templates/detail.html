@@ -32,6 +32,7 @@
 <div style="margin-top: 16px;">
   {% for ra in row_actions %}
   {% if not ra.exclude_from_detail %}
+  {% if ra.name != 'reset_password' or not obj.get('oidc_sub') %}
   <form method="post" action="/admin/{{ view.identity }}/row-action" style="display: inline;"
         {% if ra.confirmation %}onsubmit="return confirm('{{ ra.confirmation }}')"{% endif %}>
     <input type="hidden" name="action_name" value="{{ ra.name }}"/>
@@ -40,6 +41,7 @@
       <i class="{{ ra.icon_class }}"></i> {{ ra.text }}
     </button>
   </form>
+  {% endif %}
   {% endif %}
   {% endfor %}
 </div>

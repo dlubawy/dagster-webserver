@@ -331,11 +331,40 @@ class DagsterWebserver(
             me_endpoint,
         )
 
-        return [
+        routes: list[Route] = [
             Route("/login", login_endpoint, methods=["GET", "POST"], name="login"),
             Route("/logout", logout_endpoint, methods=["GET", "POST"], name="logout"),
             Route("/api/me", me_endpoint, methods=["GET"], name="api-me"),
         ]
+
+        # Register OIDC routes when using HybridSessionAuthProvider
+        if self._auth_provider:
+            from dagster_webserver.auth.provider import HybridSessionAuthProvider
+
+            if isinstance(self._auth_provider, HybridSessionAuthProvider):
+                from dagster_webserver.auth.oidc.routes import (
+                    oidc_authorize_endpoint,
+                    oidc_callback_endpoint,
+                )
+
+                routes.extend(
+                    [
+                        Route(
+                            "/oidc/authorize/{provider_name}",
+                            oidc_authorize_endpoint,
+                            methods=["GET"],
+                            name="oidc-authorize",
+                        ),
+                        Route(
+                            "/oidc/callback",
+                            oidc_callback_endpoint,
+                            methods=["GET"],
+                            name="oidc-callback",
+                        ),
+                    ]
+                )
+
+        return routes
 
     @deprecated(
         breaking_version="2.0",
