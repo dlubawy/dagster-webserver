@@ -16,6 +16,12 @@ dagster-webserver start -w path/to/workspace.yaml
 
 ## Authentication and RBAC
 
+![login page](./assets/login.png)
+
+![main page](./assets/main.png)
+
+![admin dashboard](./assets/dashboard.png)
+
 dagster-webserver supports optional user login with role-based access control.
 Auth is **disabled by default** — enable it with the `--auth-provider` flag.
 
