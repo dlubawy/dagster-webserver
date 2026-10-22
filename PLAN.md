@@ -1,545 +1,815 @@
-# Plan: OIDC Login Capabilities for Dagster Webserver
+# Implementation Plan — DagsterAgent for OSS
 
-## Goal
+## Scope
 
-Add OpenID Connect (OIDC) login to the existing auth system so that users can authenticate via external identity providers (Google, Okta, Auth0, Azure AD, Keycloak, etc.) in addition to the existing username/password flow. OIDC provider configurations are stored in the database, managed through the admin portal, and rendered as dynamic buttons on the login page.
+Build a `dagster-agent` process that replaces `dagster-cloud agent run` for DAGSTER OSS. The agent connects to our forked `dagster-webserver`, manages code location gRPC servers via pluggable launchers, and processes work requests from a database-backed queue.
 
-## Pre-existing Infrastructure
+**Research references**: All design details are in `.agent/research/*.md`:
 
-The following already exists in `dagster_webserver/` and is **not** part of this plan:
-
-- **Auth system** (`auth/`): `SessionAuthProvider`, `AuthMiddleware`, `login_endpoint`, `logout_endpoint`, `me_endpoint`, `AuthUser`, `UserBackend`, `DatabaseUserBackend`, `Role` enum, `get_role_permissions()`
-- **Database layer** (`database/`): SQLAlchemy models (`User`, `Role`), async engine (`get_engine()`, `get_session_factory()`), Alembic migration `001_create_roles_and_users`
-- **Admin portal** (`admin/`): `AdminPortal`, `BaseAdminView`, `UserView`, `RoleView`, `AdminPermission` enum (4 values), `AdminPortalMiddleware`, Jinja2 templates
-- **Webserver** (`webserver.py`): `DagsterWebserver` with `_auth_provider`, `_admin_portal`, `build_middleware()`, `_build_auth_routes()`, `build_routes()`
-- **Login page**: Inline HTML template in `dagster_webserver/auth/routes.py` (`_LOGIN_TEMPLATE`)
-- **Permission model**: 5 built-in roles, 21 Dagster `Permissions`, 4 `AdminPermission` values
-
-See `/.agent/research/11-oidc-login-research.md` for full OIDC protocol details, library selection rationale, security considerations, and provider configuration examples.
+- `dagster-agent-overview.md` — Architecture and goals
+- `dagster-cloud-agent-analysis.md` — Cloud agent internals analysis
+- `user-code-launcher-design.md` — Launcher abstraction design
+- `agent-instance-design.md` — Instance configuration design
+- `webserver-integration.md` — Webserver API design
+- `daemon-considerations.md` — Daemon integration analysis
+- `implementation-roadmap.md` — Phased timeline
 
 ______________________________________________________________________
 
-## Phase 1: Database Schema — OIDC Provider Model + Migration
+## Phase 1: Database Schema and Models
 
-**Objective**: Add the `oidc_providers` table and OIDC linkage columns to the `users` table.
+**Objective**: Create all database tables and SQLAlchemy ORM models that the agent system depends on.
 
-### Step 1.1: Add `OIDCProvider` ORM model to `dagster_webserver/database/models.py`
+### Task 1.1: Alembic Migration `003_create_agent_tables`
 
-- Define `OIDCProvider(Base)` with columns:
-  - `id` (Integer PK, autoincrement)
-  - `name` (String(64), unique, not null) — internal identifier (e.g. "google", "okta")
-  - `display_name` (String(128), not null) — human-readable name (e.g. "Google")
-  - `issuer_url` (String(512), not null) — OIDC issuer URL
-  - `client_id` (String(256), not null)
-  - `client_secret` (String(1024), not null)
-  - `scopes` (String(512), default `"openid email profile"`)
-  - `enabled` (Boolean, default True)
-  - `display_order` (Integer, default 0)
-  - `created_at`, `updated_at` (DateTime with timezone, server defaults)
-- Add `users` relationship: `Mapped[list["User"]] = relationship("User", back_populates="oidc_provider")`
-- Export `OIDCProvider` from `dagster_webserver/database/__init__.py`
+Create `dagster_webserver/database/alembic/versions/003_create_agent_tables.py`:
 
-**Outcome**: `OIDCProvider` is a first-class ORM model queryable via SQLAlchemy.
+**New tables:**
 
-### Step 1.2: Extend `User` model with OIDC linkage columns
+- **`agent_heartbeats`** — Tracks agent health (agent_id, labels, type, timestamp, metadata, errors)
+- **`agent_requests`** — Work queue for agents (id, request_api, request_body, location_name, labels, status, assigned_to_agent, created_at, popped_at, expires_at, response_body)
+- **`code_location_definitions`** — Workspace entries managed by webserver (location_name, deploy_metadata JSONB, labels, status, last_loaded_at, load_error, loaded_manifest)
+- **`code_location_snapshots`** — Loaded repository data with SHA1 dedup (location_name, snapshot_type, sha1_hash, size_bytes, data BYTEA). **Note**: BYTEA storage is the initial implementation. The storage backend can be swapped to file-based or object storage later by introducing a `SnapshotStorage` abstract class with pluggable implementations.
+- **`api_keys`** — User-owned API keys for programmatic access (see below)
+- **`user_role_assignments`** — Per-location role assignments (see below)
 
-- In `dagster_webserver/database/models.py`, add to `User`:
-  - `oidc_provider_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("oidc_providers.id"), nullable=True)`
-  - `oidc_sub: Mapped[str | None] = mapped_column(String(256), nullable=True)`
-  - `oidc_provider: Mapped["OIDCProvider | None"] = relationship("OIDCProvider", back_populates="users")`
+```sql
+-- Generic API keys owned by users (service accounts or regular users)
+CREATE TABLE api_keys (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),  -- Owner of the key
+    key_hash VARCHAR(128) NOT NULL,                 -- SHA-256 hash of the API key
+    name VARCHAR(128) NOT NULL,                     -- Human-readable label (e.g. "prod-agent")
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMP WITH TIME ZONE,            -- Optional expiration
+    last_used_at TIMESTAMP WITH TIME ZONE           -- Updated on each successful auth
+);
+CREATE UNIQUE INDEX idx_api_keys_hash ON api_keys (key_hash);
 
-**Outcome**: Users can be linked to an OIDC provider via `oidc_sub` + `oidc_provider_id`.
+-- Per-location role assignments. Replaces the single users.role_id for
+-- location-scoped permission resolution.
+CREATE TABLE user_role_assignments (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    role_id INTEGER NOT NULL REFERENCES roles(id),
+    code_location_name VARCHAR(256),  -- NULL = global assignment (all locations)
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, role_id, code_location_name)
+);
+CREATE INDEX idx_user_role_assignments_user ON user_role_assignments (user_id);
+```
 
-### Step 1.3: Create Alembic migration `002_create_oidc_providers.py`
+**Modifications to existing tables:**
 
-- In `dagster_webserver/database/alembic/versions/002_create_oidc_providers.py`:
-  - `upgrade()`:
-    - `op.create_table("oidc_providers", ...)` with all columns from Step 1.1
-    - `op.add_column("users", sa.Column("oidc_provider_id", sa.Integer, nullable=True))`
-    - `op.add_column("users", sa.Column("oidc_sub", sa.String(256), nullable=True))`
-    - `op.create_foreign_key("fk_users_oidc_provider", "users", "oidc_providers", ["oidc_provider_id"], ["id"])`
-    - `op.create_index("ix_users_oidc_sub", "users", ["oidc_sub"])`
-  - `downgrade()`: reverse all operations
+- **`users`**: Add `is_service_account BOOLEAN NOT NULL DEFAULT FALSE` column. Service accounts can only authenticate via API key — they cannot use password or OIDC login.
+- **Migration of existing data**: For each user with a non-null `role_id`, insert a row into `user_role_assignments` with `code_location_name = NULL` (global). The existing `users.role_id` column is kept for backward compatibility but becomes read-only (new code uses `user_role_assignments`).
 
-**Outcome**: Migration creates the `oidc_providers` table and extends `users` with OIDC columns. Migration is additive (no data loss).
+Full SQL DDL for agent tables is in `webserver-integration.md §2`.
 
-______________________________________________________________________
+**Outcome**: Running `dagster-webserver db migrate` creates all six new tables, adds `is_service_account` to users, and migrates existing role assignments.
 
-## Phase 2: OIDC CRUD Methods on `DatabaseUserBackend`
+### Task 1.2: SQLAlchemy ORM Models
 
-**Objective**: Add OIDC provider and user management methods to `DatabaseUserBackend`.
+Add the following new models to `dagster_webserver/database/models.py`:
 
-### Step 2.1: OIDC provider CRUD
+- `AgentHeartbeat(Base)` — maps to `agent_heartbeats`
+- `AgentRequest(Base)` — maps to `agent_requests`
+- `CodeLocationDefinition(Base)` — maps to `code_location_definitions`
+- `CodeLocationSnapshot(Base)` — maps to `code_location_snapshots`
+- `ApiKey(Base)` — maps to `api_keys` (with relationship to `User`)
+- `UserRoleAssignment(Base)` — maps to `user_role_assignments` (with relationships to `User` and `Role`)
 
-Add to `dagster_webserver/auth/db_backend.py`:
+Modify existing models:
 
-- `async def list_oidc_providers(self, *, enabled_only: bool = False) -> list[OIDCProvider]`
-  - Query `OIDCProvider` ordered by `display_order`, filter by `enabled` if `enabled_only`
-- `async def get_oidc_provider(self, name: str) -> OIDCProvider | None`
-  - Query by `name`
-- `async def get_oidc_provider_by_id(self, provider_id: int) -> OIDCProvider | None`
-  - Query by `id`
-- `async def create_oidc_provider(self, name: str, display_name: str, issuer_url: str, client_id: str, client_secret: str, scopes: str = "openid email profile", display_order: int = 0) -> OIDCProvider`
-  - Insert new `OIDCProvider`, commit, return
-  - Raises `IntegrityError` if `name` already exists
-- `async def update_oidc_provider(self, name: str, *, display_name: str | None = None, issuer_url: str | None = None, client_id: str | None = None, client_secret: str | None = None, scopes: str | None = None, enabled: bool | None = None, display_order: int | None = None) -> OIDCProvider`
-  - Update fields, commit, return
-  - Raises `ValueError` if not found
-- `async def delete_oidc_provider(self, name: str) -> None`
-  - Delete provider, cascade null out `oidc_provider_id` on linked users
-  - Raises `ValueError` if not found
+- `User`: Add `is_service_account: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)`
+- `User`: Add `role_assignments: Mapped[list["UserRoleAssignment"]] = relationship(...)`
+- `Role`: Add `assignments: Mapped[list["UserRoleAssignment"]] = relationship(...)`
 
-**Outcome**: Full CRUD for OIDC providers via `DatabaseUserBackend`.
+Follow the existing model patterns in the file (DeclarativeBase, mapped_column, Mapped types). Existing models use sync SQLAlchemy (`sqlalchemy.orm.DeclarativeBase`) while `engine.py` provides async sessions. The agent tables follow the same dual-pattern — sync models for ORM definition, async sessions at access time.
 
-### Step 2.2: OIDC user lookup and creation methods
+**Outcome**: Models are importable from `dagster_webserver.database.models`.
 
-Add to `dagster_webserver/auth/db_backend.py`:
+### Task 1.3: Database Access Helpers
 
-- `async def get_user_by_oidc(self, provider_id: int, oidc_sub: str) -> AuthUser | None`
-  - Query `User` where `oidc_provider_id = provider_id` AND `oidc_sub = oidc_sub`
-  - Join `role` and `oidc_provider`, return `AuthUser` or `None`
-- `async def get_user_by_email(self, email: str) -> AuthUser | None`
-  - Query `User` where `email = email`, join `role`, return `AuthUser` or `None`
-- `async def create_oidc_user(self, username: str, provider_id: int, oidc_sub: str, *, email: str | None = None, display_name: str | None = None, role: str = "viewer") -> AuthUser`
-  - Create `User` with `oidc_provider_id`, `oidc_sub`, `email`, `display_name`, `role_id`
-  - `password_hash` set to empty string (OIDC users don't have passwords)
-  - Raises `ValueError` if role not found
-- `async def link_oidc_to_user(self, username: str, provider_id: int, oidc_sub: str) -> AuthUser`
-  - Update existing user's `oidc_provider_id` and `oidc_sub`
-  - Raises `ValueError` if user not found
+Create `dagster_webserver/database/agent_queries.py` with async helper functions that wrap common agent table operations:
 
-**Outcome**: OIDC users can be looked up, created, and linked to existing accounts.
+- `get_workspace_entries(session, agent_labels, location_names)` → list[CodeLocationDefinition]
+- `pop_requests(session, agent_id, agent_labels, limit)` → list[AgentRequest] (with optimistic locking)
+- `submit_heartbeat(session, heartbeat_data)` → AgentHeartbeat
+- `upsert_code_location(session, definition)` → CodeLocationDefinition
+- `store_snapshot(session, location_name, snapshot_type, sha1, data)` → CodeLocationSnapshot
+
+**Outcome**: All agent database operations go through these helpers.
 
 ______________________________________________________________________
 
-## Phase 3: OIDC Client Library Integration
+## Phase 2: Webserver REST API and API Key Auth
 
-**Objective**: Create the OIDC client wrapper that handles the authorization code + PKCE flow using Authlib.
+**Objective**: Implement the REST endpoints under `/api/agent` and extend the existing auth system to support user-owned API keys with per-location role assignments.
 
-### Step 3.1: Add optional dependencies to `pyproject.toml`
+### Task 2.1: API Key Authentication (Integrated into All Providers)
 
-- Add `[project.optional-dependencies]` group:
-  ```toml
-  auth-oidc = ["authlib>=1.3.0", "httpx>=0.27.0"]
-  ```
+Extend the existing auth system so that all provider types support API key authentication via `Authorization: Bearer <key>` headers. This unifies authentication — one `User` model, one set of roles, per-location permission resolution.
 
-**Outcome**: `authlib` and `httpx` are installable via `pip install dagster-webserver[auth-oidc]`.
+**Design**: Service accounts are regular `User` rows with `is_service_account=True`. They cannot log in via password or OIDC (the login route rejects them). They authenticate exclusively via API key. Regular users can also have API keys for programmatic access. API key support is built into every provider type — not a separate provider.
 
-### Step 3.2: Create `dagster_webserver/auth/oidc/__init__.py`
+**Changes to `auth/users.py`**:
 
-- Export: `OIDCProviderConfig`, `OIDCClient`, `HybridSessionAuthProvider`
-
-**Outcome**: Clean public API for the OIDC module.
-
-### Step 3.3: Create `dagster_webserver/auth/oidc/models.py`
-
-- Define `@dataclass OIDCProviderConfig`:
-  - `id: int`, `name: str`, `display_name: str`, `issuer_url: str`, `client_id: str`, `client_secret: str`, `scopes: str`, `enabled: bool`, `display_order: int`
-- Define `from_orm(provider: OIDCProvider) -> OIDCProviderConfig` factory method
-- Define `SESSION_OIDC_STATE`, `SESSION_OIDC_VERIFIER`, `SESSION_OIDC_PROVIDER`, `SESSION_OIDC_NONCE`, `SESSION_OIDC_REDIRECT` string constants for session keys
-
-**Outcome**: Dataclass for OIDC provider configuration and session key constants.
-
-### Step 3.4: Create `dagster_webserver/auth/oidc/client.py`
-
-- Define `class OIDCClient`:
-  - `__init__(self, provider: OIDCProviderConfig)` — stores provider config
-  - `async def discover(self) -> dict` — fetch `.well-known/openid-configuration` from issuer, cache result. Returns dict with `authorization_endpoint`, `token_endpoint`, `jwks_uri`, etc.
-  - `async def get_authorization_url(self, redirect_uri: str, state: str, code_challenge: str, nonce: str) -> str` — build authorization URL with PKCE challenge and nonce
-  - `async def exchange_code(self, code: str, redirect_uri: str, code_verifier: str) -> dict` — POST to token endpoint with code + PKCE verifier. Returns `{"id_token": ..., "access_token": ...}`
-  - `async def verify_id_token(self, id_token: str, nonce: str | None = None) -> dict` — decode and verify JWT: signature (via JWKS), `iss` matches `issuer_url`, `aud` contains `client_id`, `exp` not expired, `nonce` matches if provided. Returns claims dict.
-  - `async def _fetch_jwks(self) -> dict` — fetch and cache JWKS from `jwks_uri`
-
-**Outcome**: OIDC client handles discovery, authorization URL building, token exchange, and ID token verification.
-
-### Step 3.5: PKCE helpers
-
-- In `dagster_webserver/auth/oidc/client.py`, add module-level helpers:
-  - `generate_code_verifier() -> str` — random 43-128 char string (RFC 7636)
-  - `generate_code_challenge(verifier: str) -> str` — BASE64URL(SHA256(verifier))
-  - `generate_state(provider_name: str) -> str` — `{random_hex}:{provider_name}`
-  - `parse_state(state: str) -> tuple[str, str]` — split into `(random_hex, provider_name)`
-
-**Outcome**: PKCE and state generation/parsing utilities.
-
-______________________________________________________________________
-
-## Phase 4: `HybridSessionAuthProvider`
-
-**Objective**: Extend `SessionAuthProvider` with OIDC login capabilities.
-
-### Step 4.1: Create `HybridSessionAuthProvider` in `dagster_webserver/auth/provider.py`
-
-- Define `class HybridSessionAuthProvider(SessionAuthProvider)`:
-  - `__init__(self, user_backend: DatabaseUserBackend, config: AuthConfig | None = None)` — calls `super().__init__()`, asserts `isinstance(user_backend, DatabaseUserBackend)`
-  - Inherits `authenticate_request()` from `SessionAuthProvider` (session-based auth works for both password and OIDC logins)
-  - Inherits `login()` and `logout()` from `SessionAuthProvider` (password login unchanged)
-
-**Outcome**: `HybridSessionAuthProvider` supports both password and OIDC login through the same session mechanism.
-
-### Step 4.2: `get_oidc_providers()` method
-
-- `async def get_oidc_providers(self) -> list[OIDCProviderConfig]`
-  - Calls `self._user_backend.list_oidc_providers(enabled_only=True)`
-  - Converts ORM objects to `OIDCProviderConfig` dataclass instances
-
-**Outcome**: Returns list of enabled OIDC providers for the login page.
-
-### Step 4.3: `initiate_oidc_login()` method
-
-- `async def initiate_oidc_login(self, provider_name: str, request: Request) -> RedirectResponse`
-  1. Look up provider by `provider_name` via `self._user_backend.get_oidc_provider(provider_name)`
-  1. If not found or not enabled → `RedirectResponse` to `/login` with error query param
-  1. Capture `next_url` from `request.query_params.get("next", "/")` — validate it is a relative path starting with `/` (open redirect prevention)
-  1. Generate PKCE `code_verifier` and `code_challenge`
-  1. Generate `state` = `{random_hex}:{provider_name}`
-  1. Generate `nonce` = `secrets.token_urlsafe(32)`
-  1. Store in session: `SESSION_OIDC_STATE → state`, `SESSION_OIDC_VERIFIER → code_verifier`, `SESSION_OIDC_NONCE → nonce`, `SESSION_OIDC_REDIRECT → next_url`
-  1. Create `OIDCClient(provider_config)` and call `client.get_authorization_url(redirect_uri, state, code_challenge, nonce)`
-  1. Return `RedirectResponse(authorization_url, status_code=302)`
-
-**Outcome**: Initiates the OIDC authorization flow with PKCE, state, and the original destination URL preserved for post-login redirect.
-
-### Step 4.4: `handle_oidc_callback()` method
-
-- `async def handle_oidc_callback(self, request: Request) -> AuthUser | None`
-  1. Extract `code` and `state` from query params. If missing → return `None`
-  1. Verify `state` matches `request.session.get(SESSION_OIDC_STATE)`. If mismatch → return `None` (CSRF protection)
-  1. Parse `state` to get `provider_name`
-  1. Retrieve `code_verifier` and `nonce` from session
-  1. Look up provider config by `provider_name`
-  1. Create `OIDCClient(provider_config)` and call `client.exchange_code(code, redirect_uri, code_verifier)`
-  1. Call `client.verify_id_token(id_token, nonce)` — raises on verification failure
-  1. Extract `sub`, `email`, `name` from verified claims
-  1. Call `self._link_or_create_user(provider, sub, email, name)` (see Step 4.5)
-  1. Set `request.session["username"] = user.username`
-  1. Clear OIDC session state keys
-  1. Return `AuthUser`
-
-**Outcome**: Handles the OIDC callback, exchanges code, verifies token, creates/logs in user.
-
-### Step 4.5: `_link_or_create_user()` method
-
-- `async def _link_or_create_user(self, provider: OIDCProviderConfig, oidc_sub: str, email: str | None, name: str | None) -> AuthUser`
-  1. `existing = await self._user_backend.get_user_by_oidc(provider.id, oidc_sub)` — if found, return it
-  1. If `email`: `email_user = await self._user_backend.get_user_by_email(email)` — if found, call `self._user_backend.link_oidc_to_user(email_user.username, provider.id, oidc_sub)` and return updated user
-  1. Otherwise: `username = email or f"oidc_{provider.name}_{oidc_sub}"` — call `self._user_backend.create_oidc_user(username, provider.id, oidc_sub, email=email, display_name=name, role=self.config.default_role)`
-
-**Outcome**: OIDC users are auto-provisioned with account linking via email match.
-
-### Step 4.6: Export from `dagster_webserver/auth/__init__.py`
-
-- Add `HybridSessionAuthProvider` to imports and `__all__`
-
-**Outcome**: `HybridSessionAuthProvider` is importable from the auth package.
-
-______________________________________________________________________
-
-## Phase 5: OIDC Routes
-
-**Objective**: Add `/oidc/authorize/{provider_name}` and `/oidc/callback` route handlers.
-
-### Step 5.1: Create `dagster_webserver/auth/oidc/routes.py`
-
-- `async def oidc_authorize_endpoint(request: Request) -> RedirectResponse`
-
-  - Extract `provider_name` from path params
-  - Get `HybridSessionAuthProvider` from `request.app.state.auth_provider`
-  - Call `provider.initiate_oidc_login(provider_name, request)`
-  - If provider doesn't support OIDC (not `HybridSessionAuthProvider`) → 404
-
-- `async def oidc_callback_endpoint(request: Request) -> RedirectResponse | HTMLResponse`
-
-  - Get `HybridSessionAuthProvider` from `request.app.state.auth_provider`
-  - Call `provider.handle_oidc_callback(request)`
-  - If `AuthUser` returned → retrieve `next_url` from `request.session.get(SESSION_OIDC_REDIRECT, "/")`, validate it is a relative path starting with `/` (no `//`, no protocol schemes), redirect to `next_url`
-  - If `None` → redirect to `/login` with error query param
-  - Handle error cases (invalid state, missing code, token verification failure) with user-friendly error messages
-
-**Outcome**: OIDC authorize and callback endpoints are functional. After successful OIDC login, the user is redirected to the page they were originally trying to reach.
-
-### Step 5.2: Register OIDC routes in `DagsterWebserver._build_auth_routes()`
-
-- In `dagster_webserver/webserver.py`, modify `_build_auth_routes()`:
+- Add abstract method to `UserBackend` ABC:
   ```python
-  def _build_auth_routes(self) -> list[Route]:
-      routes = [
-          Route("/login", login_endpoint, methods=["GET", "POST"], name="login"),
-          Route("/logout", logout_endpoint, methods=["GET", "POST"], name="logout"),
-          Route("/api/me", me_endpoint, methods=["GET"], name="api-me"),
-      ]
-      if self._auth_provider and isinstance(self._auth_provider, HybridSessionAuthProvider):
-          from dagster_webserver.auth.oidc.routes import (
-              oidc_authorize_endpoint,
-              oidc_callback_endpoint,
-          )
-          routes.extend([
-              Route("/oidc/authorize/{provider_name}", oidc_authorize_endpoint, methods=["GET"], name="oidc-authorize"),
-              Route("/oidc/callback", oidc_callback_endpoint, methods=["GET"], name="oidc-callback"),
-          ])
-      return routes
+  async def get_user_by_api_key(self, api_key: str) -> AuthUser | None:
+      """Look up a user by their API key (hashed and matched against stored keys)."""
+      ...
   ```
-
-**Outcome**: OIDC routes are registered when `HybridSessionAuthProvider` is used.
-
-### Step 5.3: Add OIDC routes to allowed routes in `AuthMiddleware`
-
-- OIDC routes (`oidc-authorize`, `oidc-callback`) must be accessible without authentication
-- The `AuthMiddleware._is_allowed_without_auth()` already checks `route.name` against `self.provider.config.allowed_routes`
-- Default `AuthConfig.allowed_routes` is `[]` — callers must include `"oidc-authorize"` and `"oidc-callback"` when using `HybridSessionAuthProvider`
-- **Action**: In the CLI or app creation code, when `HybridSessionAuthProvider` is used, ensure `allowed_routes` includes `"oidc-authorize"` and `"oidc-callback"`
-
-**Outcome**: OIDC routes bypass authentication check in middleware.
-
-______________________________________________________________________
-
-## Phase 6: Login Page — Dynamic OIDC Buttons
-
-**Objective**: Modify the login page to render OIDC provider buttons alongside the password form.
-
-### Step 6.1: Modify `login_endpoint` in `dagster_webserver/auth/routes.py`
-
-- In the GET branch, after getting the provider:
+- Extend `AuthUser` dataclass with new fields:
   ```python
-  oidc_providers = []
-  if hasattr(provider, "get_oidc_providers"):
-      oidc_providers = await provider.get_oidc_providers()
-  return HTMLResponse(_render_login(oidc_providers=oidc_providers))
+  is_service_account: bool = False
   ```
 
-**Outcome**: Login endpoint fetches OIDC providers and passes them to the template.
+**Changes to `auth/db_backend.py`** (`DatabaseUserBackend`):
 
-### Step 6.2: Modify `_render_login()` and `_LOGIN_TEMPLATE`
+- Implement `get_user_by_api_key(token)`:
 
-- Change `_render_login(error: str | None = None)` signature to `_render_login(error: str | None = None, oidc_providers: list[OIDCProviderConfig] | None = None)`
-- In `_LOGIN_TEMPLATE`, after the password form's closing `</form>` and before the footer, inject an OIDC buttons section:
-  - Divider: `<hr/>` with "Or sign in with" text
-  - For each provider: `<a href="/oidc/authorize/{name}" class="login-oidc-btn">` with provider-specific styling
-  - CSS for OIDC buttons: flex row, branded colors per provider (`--google: #4285F4`, `--okta: #007DC1`, `--auth0: #EB5424`, generic fallback `#4f438d`)
-  - Inline SVG icons for known providers (Google, Okta)
-  - Fallback shield icon for unknown providers
-- Use string formatting (not Jinja2) since the template is an inline string: build the OIDC buttons HTML in `_render_login()` and inject via `{oidc_buttons}` placeholder
+  1. SHA-256 hash the token
+  1. Look up in `api_keys` table (joined with `users` and `user_role_assignments`)
+  1. Verify `is_active=True` and not expired
+  1. Update `last_used_at`
+  1. Return `AuthUser` with resolved role info from assignments
 
-**Outcome**: Login page dynamically renders OIDC provider buttons.
+- Add API key CRUD methods:
 
-### Step 6.3: CSS for OIDC buttons
+  - `create_api_key(user_id, name, expires_at) -> tuple[ApiKey, str]` — returns both the ORM object and the plaintext key (shown once)
+  - `list_api_keys(user_id) -> list[ApiKey]`
+  - `revoke_api_key(key_id) -> bool`
 
-- Add to the `<style>` block in `_LOGIN_TEMPLATE`:
-  - `.login-divider`: horizontal rule with centered text
-  - `.login-oidc-buttons`: flex container, gap between buttons
-  - `.login-oidc-btn`: button styling (height, padding, border-radius, hover states, focus states matching existing button styles)
-  - `.login-oidc-btn--google`, `.login-oidc-btn--okta`, etc.: provider-specific background colors
-  - `.login-oidc-icon`: inline SVG sizing
-  - Dark mode support matching existing theme tokens
+- Add service account creation:
 
-**Outcome**: OIDC buttons are styled consistently with the Dagster login page.
+  - `create_service_account(username, role_name, display_name=None) -> AuthUser` — creates a user with `is_service_account=True`, empty `password_hash`, and a global role assignment in `user_role_assignments`
+
+- Add per-location role assignment methods:
+
+  - `assign_role_to_location(user_id, role_name, code_location_name) -> UserRoleAssignment`
+  - `remove_role_from_location(user_id, role_name, code_location_name) -> bool`
+  - `get_user_roles_for_location(user_id, location_name) -> list[Role]` — returns all roles where `code_location_name IS NULL OR code_location_name = location_name`
+
+**Changes to `auth/provider.py`**:
+
+- **`SessionAuthProvider.authenticate_request()`**: Before checking session, check for `Authorization: Bearer` header. If present, call `self._user_backend.get_user_by_api_key(token)`. If a user is returned, set `request.state.user` and return. If the Bearer header is present but invalid, return `None` (don't fall through to session).
+- **`HybridSessionAuthProvider.authenticate_request()`**: Same change — API key check first, then OIDC/session fallback.
+- **Remove `--auth-provider=api-key` CLI option** from `cli.py`. The `ApiKeyAuthProvider` class remains in the codebase for backward compatibility but is no longer exposed as a standalone provider option.
+
+**Changes to `auth/roles.py`**:
+
+- Add location-aware permission resolution:
+  ```python
+  def resolve_permissions_for_location(
+      role_assignments: list[tuple[Role, str | None]],
+      location_name: str | None,
+  ) -> dict[str, PermissionResult]:
+      """Merge permissions from all applicable role assignments.
+
+      A role assignment applies if its code_location_name is NULL (global)
+      or matches the requested location_name. When multiple roles apply,
+      permissions are merged (OR logic — if any applicable role grants a
+      permission, it's enabled).
+      """
+  ```
+
+**Changes to `auth/middleware.py`**:
+
+- No structural changes needed. The middleware already calls `provider.authenticate_request()` and checks `_is_api_request()`. API key auth is transparently handled inside the provider.
+- Add code location scope enforcement for `/api/agent/*` routes: after auth, extract the target location from query params or request body, call `resolve_permissions_for_location()`, and reject if the user has no applicable role for that location.
+
+**Changes to `cli.py`**:
+
+- Remove `--auth-provider=api-key` option from the webserver command.
+- Update `_build_auth_provider()` — no longer returns `ApiKeyAuthProvider`.
+
+**Outcome**: All auth providers support API key authentication transparently. Per-location permission resolution works via `user_role_assignments`. Service accounts can only use API keys.
+
+### Task 2.2: CLI Commands for Service Accounts and API Keys
+
+Add subcommands under `dagster-webserver db` (following existing CLI patterns):
+
+```
+# Create a service account (agent user)
+dagster-webserver db create-service-account --username svc/agent-prod --role agent-manager --database-url ...
+
+# Assign a role to a specific code location
+dagster-webserver db assign-role --user svc/agent-prod --role launcher --location my-location --database-url ...
+
+# Create an API key for any user (service account or regular)
+dagster-webserver db create-api-key --user svc/agent-prod --name "prod-key" [--expires-in 90d] --database-url ...
+# Outputs the plaintext key once — it is stored only as a SHA-256 hash
+
+# List API keys for a user
+dagster-webserver db list-api-keys --user svc/agent-prod --database-url ...
+
+# Revoke (deactivate) an API key
+dagster-webserver db revoke-api-key --key-id 123 --database-url ...
+```
+
+**Outcome**: Admins can create service accounts, assign per-location roles, and manage API keys via CLI.
+
+### Task 2.3: Agent REST Router
+
+Create `dagster_webserver/api/__init__.py` and `dagster_webserver/api/agent.py`:
+
+Define a Starlette `APIRouter` with the following endpoints:
+
+| Method | Path | Handler | Purpose |
+| ------ | ------------------------------ | --------------------------- | ------------------------------------------------------------------- |
+| GET | `/api/agent/workspace-entries` | `get_workspace_entries` | Return code locations for this agent (filtered by role assignments) |
+| POST | `/api/agent/enqueue-request` | `enqueue_request` | Add work to the queue (for UI/daemon) |
+| POST | `/api/agent/pop-requests` | `pop_requests` | Agent pops pending work items (filtered by role assignments) |
+| POST | `/api/agent/heartbeat` | `submit_heartbeat` | Agent reports health |
+| POST | `/api/agent/upload-data` | `upload_code_location_data` | Agent uploads loaded manifests |
+| GET | `/api/agent/check-snapshot` | `check_snapshot` | Check if snapshot already stored |
+| POST | `/api/agent/upload-snapshot` | `upload_snapshot` | Upload a serialized snapshot |
+
+**Design notes**:
+
+- Use async SQLAlchemy sessions from `engine.get_session_factory()` (existing pattern).
+- All endpoints require authentication (via API key or session). The existing `AuthMiddleware` handles this — `/api/agent/*` is already covered by `_is_api_request()`.
+- Code location scoping: handlers check that the authenticated user has a role assignment for the requested location (via `get_user_roles_for_location()`). If no applicable role, return 403.
+- Mount the router in `DagsterWebserver.build_routes()` alongside existing routes.
+
+Full endpoint specifications are in `webserver-integration.md §4`.
+
+**Outcome**: All seven REST endpoints respond correctly with proper HTTP status codes and location-scoped access control.
+
+### Task 2.4: Code Location CRUD Endpoints
+
+Add admin-facing endpoints for managing code location definitions:
+
+| Method | Path | Handler | Purpose |
+| ------ | ---------------------------------- | ---------------------- | ------------------------------------- |
+| POST | `/api/agent/code-locations` | `create_code_location` | Create a new code location definition |
+| PUT | `/api/agent/code-locations/{name}` | `update_code_location` | Update deploy metadata / labels |
+| DELETE | `/api/agent/code-locations/{name}` | `delete_code_location` | Remove a code location |
+| GET | `/api/agent/code-locations` | `list_code_locations` | List all code locations with status |
+
+These endpoints require admin-level RBAC permissions. They use the existing user auth (session or API key with appropriate role).
+
+**Outcome**: Code locations can be managed via REST API by admins.
+
+### Task 2.5: Admin Portal — Code Locations and Service Accounts
+
+Extend the existing admin portal (`dagster_webserver/admin/portal.py`) with new sections:
+
+- Add a new "Code Locations" admin panel section in `admin/views.py`.
+  - Create template files for code location list/create/edit views (reuse existing template patterns from `admin/templates/`).
+  - Wire up to the CRUD endpoints from Task 2.4.
+- Add a "Service Accounts & API Keys" view alongside existing user/role management.
+  - List service accounts with their active API keys and assigned locations.
+  - Create/revoke API keys from the UI.
+
+**Outcome**: Admin portal at `/admin` includes code location and service account management.
+
+### Task 2.5b: Admin Portal — Scoped Role Assignment UI
+
+Update existing admin portal user management views to reflect per-location role assignments:
+
+- **User detail page**: Replace the single "role" dropdown with a "Role Assignments" table showing:
+  - Columns: Role | Scope (Global / location name) | Actions (Remove)
+  - An "Add Assignment" form: select role + optional code location (leave blank for global).
+  - Existing users migrated from `users.role_id` show as a single global row.
+- **Code location detail page** (new): Show which users/service accounts have access to this location and at what role level. Allows adding/removing assignments scoped to that location.
+- **Role listing page**: Add a column showing how many users/locations each role is assigned to.
+
+**Backend endpoints needed** (add to `api/agent.py` or a new `api/admin.py`):
+
+| Method | Path | Purpose |
+| ------ | ---------------------------------------------- | -------------------------------------------------------------------------- |
+| GET | `/api/admin/users/{username}/role-assignments` | List all role assignments for a user |
+| POST | `/api/admin/users/{username}/role-assignments` | Add a role assignment (body: `{"role": "launcher", "location": "my-loc"}`) |
+| DELETE | `/api/admin/role-assignments/{id}` | Remove a specific assignment |
+| GET | `/api/agent/code-locations/{name}/access` | List users with access to this location and their roles |
+
+These endpoints call the `assign_role_to_location()`, `remove_role_from_location()`, and `get_user_roles_for_location()` methods from Task 2.1.
+
+**Outcome**: Admins can manage per-location role assignments through the admin portal UI.
+
+### Task 2.6: Workspace Entry Source — Database + YAML Support
+
+Support two sources for code location definitions:
+
+1. **Database** (primary): Code locations defined via admin portal / REST API, stored in `code_location_definitions` table.
+1. **YAML file** (optional, for backcompat): If a `workspace.yaml` exists at `DAGSTER_HOME/workspace.yaml`, load entries from it on webserver startup and upsert them into the database table. This mirrors the standard OSS workspace loading pattern.
+
+The YAML format:
+
+```yaml
+locations:
+  - name: my-location
+    python_file: /path/to/file.py
+    working_directory: /path/to/dir
+    labels:
+      deployment: production
+```
+
+Implementation: Create `dagster_webserver/api/workspace_loader.py` with a function that loads from YAML and upserts into the database. Call it during webserver startup (in the lifespan or CLI).
+
+**Outcome**: Code locations can be defined via admin portal, REST API, or `workspace.yaml`.
+
+### Task 2.7: Login Route — Reject Service Accounts
+
+Update the login route handler to reject authentication attempts for service accounts:
+
+- In the password login handler: after looking up the user by username, check `is_service_account`. If true, return a generic "invalid credentials" error (don't leak that the account exists).
+- In the OIDC callback: if an OIDC sub maps to a service account user, reject the link.
+
+**Outcome**: Service accounts can only authenticate via API key, never via password or OIDC.
 
 ______________________________________________________________________
 
-## Phase 7: Admin Portal — OIDC Provider Management
+## Phase 3: Agent Package — Core Types and CLI
 
-**Objective**: Add OIDC provider CRUD to the admin portal.
+**Objective**: Create the `dagster_agent` package with core data types, HTTP client, and CLI entry point. Lives in this repo under `dagster_agent/`.
 
-### Step 7.1: Add OIDC admin permissions to `dagster_webserver/admin/permissions.py`
+### Task 3.1: Package Structure
 
-- Add to `AdminPermission` enum:
-  - `ADMIN_VIEW_OIDC = "admin_view_oidc"`
-  - `ADMIN_EDIT_OIDC = "admin_edit_oidc"` (implies view)
-- Add resolution helpers:
-  - `def can_view_oidc(perms) -> bool` — checks `ADMIN_EDIT_OIDC` or `ADMIN_VIEW_OIDC`
-  - `def can_edit_oidc(perms) -> bool` — checks `ADMIN_EDIT_OIDC`
-- Update `has_any_admin_permission()` to include OIDC permissions
-- Update `_admin_permissions_for_role()` in `dagster_webserver/auth/roles.py` to include `ADMIN_VIEW_OIDC` and `ADMIN_EDIT_OIDC` for the `ADMIN` role (enabled) and all other roles (disabled)
+Create the following files:
 
-**Outcome**: OIDC admin permissions are defined and wired into the role system.
+```
+dagster_agent/
+├── __init__.py
+├── cli.py                    # CLI entry point
+├── agent.py                  # DagsterAgent main class (Phase 5)
+├── instance.py               # DagsterAgentInstance (Phase 4)
+├── api/
+│   ├── __init__.py
+│   ├── types.py              # Core data types
+│   └── client.py             # HTTP client for webserver REST API
+├── user_code_launcher/
+│   ├── __init__.py
+│   ├── base.py               # DagsterUserCodeLauncher abstract base (Phase 4)
+│   └── process.py            # ProcessUserCodeLauncher (Phase 5)
+└── tests/
+    ├── __init__.py
+    ├── test_types.py
+    └── conftest.py
+```
 
-### Step 7.2: Create `OIDCProviderView` in `dagster_webserver/admin/views.py`
+Add `dagster_agent` as a package in the existing `pyproject.toml` via `[tool.hatch.build.targets.wheel.packages]`. Add CLI entry point:
 
-- Inherit from `BaseAdminView`
-- Class attributes:
-  - `identity = "oidc"`
-  - `label = "OIDC Provider"`
-  - `plural_label = "OIDC Providers"`
-  - `icon = "shield-alt"`
-  - `list_columns = ["display_name", "issuer_url", "user_count", "enabled", "display_order", "created_at"]`
-  - `detail_fields = ["name", "display_name", "issuer_url", "client_id", "scopes", "enabled", "display_order", "user_count"]`
-  - `create_fields = ["name", "display_name", "issuer_url", "client_id", "client_secret", "scopes", "display_order"]`
-  - `edit_fields = ["display_name", "issuer_url", "client_id", "client_secret", "scopes", "enabled", "display_order"]`
-- Permission hooks:
-  - `is_accessible()` → `can_view_oidc(perms)`
-  - `can_create()`, `can_edit()`, `can_delete()` → `can_edit_oidc(perms)`
-- CRUD methods delegate to `DatabaseUserBackend`:
-  - `find_all()` → `backend.list_oidc_providers()` (with eager-loaded `users` relationship to count linked users)
-  - `count()` → `len(list_oidc_providers())`
-  - `find_by_pk(pk)` → `backend.get_oidc_provider(pk)` (pk = name, with eager-loaded `users`)
-  - `create(data)` → `backend.create_oidc_provider(...)`
-  - `edit(pk, data)` → `backend.update_oidc_provider(...)`
-  - `delete(pks)` → `backend.delete_oidc_provider(name)` for each
-- `serialize()` method:
-  - Mask `client_secret` in list/detail views (show `••••••••` + last 4 chars)
-  - Populate `user_count` from `len(provider.users)` for each provider
+```toml
+[project.scripts]
+dagster-agent = "dagster_agent.cli:main"
+```
 
-**Outcome**: OIDC providers can be listed, viewed, created, edited, and deleted through the portal.
+**Outcome**: Package is importable, `dagster-agent --help` works.
 
-### Step 7.3: Wire `OIDCProviderView` into `AdminPortal`
+### Task 3.2: Core Data Types (`api/types.py`)
 
-- In `dagster_webserver/admin/portal.py`, modify `_init_views()`:
-  - Create `OIDCProviderView(self._backend)` alongside `UserView` and `RoleView`
-  - Add to `self._views` dict
+Define OSS-compatible versions of Cloud types (see `webserver-integration.md §3` and `user-code-launcher-design.md §2`):
 
-**Outcome**: OIDC provider view appears in the admin portal sidebar and dashboard.
+```python
+class DagsterAgentApi(str, Enum):
+    LAUNCH_RUN = "LAUNCH_RUN"
+    TERMINATE_RUN = "TERMINATE_RUN"
+    GET_EXTERNAL_EXECUTION_PLAN = "GET_EXTERNAL_EXECUTION_PLAN"
+    GET_EXTERNAL_SCHEDULE_EXECUTION_DATA = "GET_EXTERNAL_SCHEDULE_EXECUTION_DATA"
+    GET_EXTERNAL_SENSOR_EXECUTION_DATA = "GET_EXTERNAL_SENSOR_EXECUTION_DATA"
+    GET_EXTERNAL_PARTITION_CONFIG = "GET_EXTERNAL_PARTITION_CONFIG"
+    GET_EXTERNAL_PARTITION_NAMES = "GET_EXTERNAL_PARTITION_NAMES"
+    GET_EXTERNAL_PARTITION_TAGS = "GET_EXTERNAL_PARTITION_TAGS"
+    PING_LOCATION = "PING_LOCATION"
+    CHECK_FOR_WORKSPACE_UPDATES = "CHECK_FOR_WORKSPACE_UPDATES"
 
-### Step 7.4: Secret handling in admin forms
+@record
+class AgentRequest:
+    request_id: str
+    request_api: DagsterAgentApi
+    request_body: str
+    location_name: str | None
 
-- In `create.html`/`edit.html` templates (or `OIDCProviderView.serialize()`):
-  - `client_secret` in create form: plain text password input (required)
-  - `client_secret` in edit form: masked input with "show" toggle; empty string means "keep current value"
-  - `client_secret` in detail view: masked (`••••••••••••abc`)
-- In `OIDCProviderView.edit()`: if `client_secret` is empty string, don't pass it to `backend.update_oidc_provider()` (keep existing value)
+@record
+class AgentHeartbeat:
+    agent_id: str
+    agent_type: str | None
+    timestamp: float
+    metadata: dict[str, Any] | None
+    errors: list[str] | None
+    code_server_heartbeats: list[str] | None
 
-**Outcome**: Client secrets are protected in the admin UI.
+@record
+class CodeLocationDeployData:
+    image: str | None
+    python_file: str | None
+    module_name: str | None
+    working_directory: str | None
+    executable_path: str | None
+    attribute: str | None
+```
+
+**Outcome**: Types are serializable/deserializable via `dagster._serdes`.
+
+### Task 3.3: HTTP Client (`api/client.py`)
+
+Create an HTTP client for the agent to communicate with the webserver REST API:
+
+```python
+class AgentAPIClient:
+    """HTTP client for dagster-agent ↔ webserver communication."""
+
+    def __init__(self, base_url: str, api_key: str): ...
+
+    async def get_workspace_entries(self) → list[dict]: ...
+    async def pop_requests(self, limit: int = 10) → list[dict]: ...
+    async def submit_heartbeat(self, heartbeat: AgentHeartbeat) → bool: ...
+    async def upload_code_location_data(self, location_name: str, manifest: str) → dict: ...
+    async def upload_response(self, request_id: str, response: str) → bool: ...
+    async def check_snapshot(self, location_name: str, snapshot_type: str, sha1: str, size: int) → dict: ...
+    async def upload_snapshot(self, location_name: str, snapshot_type: str, data: bytes) → dict: ...
+```
+
+Uses `httpx.AsyncClient` with retry logic (exponential backoff). Attaches `Authorization: Bearer <api_key>` header to all requests.
+
+**Outcome**: Agent has a typed HTTP client for all webserver interactions.
+
+### Task 3.4: CLI (`cli.py`)
+
+Implement the `dagster-agent` CLI with a single command:
+
+```python
+@click.group(name="dagster-agent")
+def cli(): ...
+
+@cli.command(name="run", help="Start the Dagster agent process.")
+@click.option("--dagster-home", type=click.Path(), default=None)
+@click.option("--log-level", default="info")
+def run(dagster_home, log_level): ...
+```
+
+The `run` command:
+
+1. Sets `DAGSTER_HOME` env var if provided.
+1. Creates `DagsterAgentInstance.get()` (Phase 4).
+1. Starts the user code launcher's reconcile thread.
+1. Runs the agent main loop (Phase 5).
+
+**Outcome**: `dagster-agent run` starts up and fails gracefully with clear error messages (since dependent components don't exist yet).
 
 ______________________________________________________________________
 
-## Phase 8: Testing
+## Phase 4: DagsterAgentInstance and Launcher Base
 
-**Objective**: Verify all OIDC functionality works correctly.
+**Objective**: Create the instance class that agents use to connect to the webserver, and the abstract launcher base class.
 
-### Step 8.1: Unit tests for `OIDCClient`
+### Task 4.1: `DagsterAgentInstance` (`instance.py`)
 
-- `test_discover()` — fetches `.well-known/openid-configuration`, caches result
-- `test_get_authorization_url()` — correct URL with PKCE challenge and nonce
-- `test_exchange_code()` — POSTs to token endpoint, returns tokens
-- `test_verify_id_token_valid()` — valid token passes all checks
-- `test_verify_id_token_expired()` — expired token raises
-- `test_verify_id_token_wrong_issuer()` — wrong `iss` raises
-- `test_verify_id_token_wrong_audience()` — wrong `aud` raises
-- `test_verify_id_token_invalid_signature()` — bad signature raises
-- `test_verify_id_token_nonce_mismatch()` — wrong nonce raises
-- `test_generate_code_challenge()` — correct BASE64URL(SHA256) output
+Implement the instance subclass (see `agent-instance-design.md §3`):
 
-**Outcome**: OIDC client is thoroughly tested in isolation.
+```python
+class DagsterAgentInstance(DagsterInstance):
+    # Properties
+    webserver_url, agent_api_url
+    instance_uuid, agent_labels, allowed_locations, api_key
+    poll_interval_seconds, heartbeat_interval_seconds, request_timeout_seconds
 
-### Step 8.2: Unit tests for `HybridSessionAuthProvider`
+    # Lazy-loaded components
+    user_code_launcher → rehydrated from config
 
-- `test_initiate_oidc_login()` — correct redirect URL, state stored in session
-- `test_initiate_oidc_login_disabled_provider()` — redirects to login with error
-- `test_initiate_oidc_login_unknown_provider()` — redirects to login with error
-- `test_handle_oidc_callback_valid()` — full flow: code exchange, token verify, user login
-- `test_handle_oidc_callback_invalid_state()` — returns None (CSRF protection)
-- `test_handle_oidc_callback_missing_code()` — returns None
-- `test_handle_oidc_callback_token_verification_failure()` — returns None
-- `test_get_oidc_providers()` — returns only enabled providers
+    # Config schema (see agent-instance-design.md §2)
+    config_schema()
+    config_defaults(base_dir)
 
-**Outcome**: Auth provider OIDC methods are tested.
+    # Factory
+    get() → self
+    dispose()
+```
 
-### Step 8.3: Unit tests for `DatabaseUserBackend` OIDC methods
+Key design decisions:
 
-- `test_create_oidc_provider()` — creates provider, returns ORM object
-- `test_list_oidc_providers_enabled_only()` — filters by enabled status
-- `test_update_oidc_provider()` — updates fields correctly
-- `test_delete_oidc_provider()` — deletes provider, nulls out user links
-- `test_get_user_by_oidc()` — finds user by provider_id + sub
-- `test_get_user_by_email()` — finds user by email
-- `test_create_oidc_user()` — creates user with OIDC linkage
-- `test_link_oidc_to_user()` — links existing user to OIDC provider
+- Uses `dagster._core.instance.DagsterInstance` as base class.
+- `user_code_launcher` is a `ConfigurableClassData` rehydrated from YAML config (same pattern as Cloud).
+- HTTP client (`AgentAPIClient`) is created by the agent, not the instance. The instance provides the URL and API key.
+- No GraphQL client — agent communicates via REST endpoints.
 
-**Outcome**: Database backend OIDC methods are tested.
+**Outcome**: `DagsterAgentInstance.get()` creates a valid instance from `dagster.yaml`.
 
-### Step 8.4: Integration tests
+### Task 4.2: Launcher Base Class (`user_code_launcher/base.py`)
 
-- `test_full_oidc_login_flow()` — mock OIDC provider, full authorize → callback → session flow
-- `test_login_page_renders_oidc_buttons()` — login page includes OIDC buttons when providers configured
-- `test_login_page_no_oidc_buttons()` — login page shows only password form when no providers
-- `test_oidc_auto_provisioning()` — first-time OIDC user is created with default role
-- `test_oidc_account_linking()` — existing user with matching email gets OIDC linked
-- `test_admin_oidc_crud()` — admin can create/edit/delete OIDC providers via portal
-- `test_oidc_routes_allowed_without_auth()` — `/oidc/authorize` and `/oidc/callback` bypass auth middleware
+Implement the abstract base class (see `user-code-launcher-design.md §2`):
 
-**Outcome**: End-to-end OIDC flow is verified.
+```python
+class DagsterUserCodeLauncher(AbstractContextManager, Generic[ServerHandle]):
+    # Core state
+    _desired_entries: dict[tuple[str, str], UserCodeLauncherEntry]
+    _actual_entries: dict[tuple[str, str], UserCodeLauncherEntry]
+    _grpc_servers: dict[tuple[str, str], DagsterGrpcServer | SerializableErrorInfo]
 
-### Step 8.5: Mock OIDC provider for tests
+    # Abstract methods (concrete launchers implement)
+    user_code_deployment_type → str
+    requires_images → bool
+    _start_new_server_spinup(deployment, location, entry) → DagsterGrpcServer
+    _wait_for_new_server_ready(deployment, location, entry, handle, endpoint) → None
+    _remove_server_handle(handle) → None
+    run_launcher() → RunLauncher
 
-- In `dagster_webserver_tests/conftest.py`, create `MockOIDCProvider`:
-  - Generates RSA key pair for JWT signing
-  - Serves `.well-known/openid-configuration` (in-memory or via `httpx` mock)
-  - Accepts authorization requests, returns mock authorization code
-  - Accepts token exchange, returns signed ID token
-  - Configurable claims (`sub`, `email`, `name`)
+    # Concrete methods (shared across all launchers)
+    start() → None  # Starts reconcile thread
+    stop() → None   # Graceful shutdown
+    reconcile() → None  # Diff desired vs actual, add/update/remove servers
+    update_grpc_metadata(desired_map) → None  # Set desired state from webserver
+    has_grpc_endpoint(deployment, location) → bool  # Check if server is ready
+    get_grpc_server(deployment, location) → DagsterGrpcServer | None
+```
 
-**Outcome**: Tests can simulate a full OIDC provider without external dependencies.
+**Outcome**: Base class is importable and all abstract methods are documented. Concrete launchers can subclass it.
 
 ______________________________________________________________________
 
-## File Inventory
+## Phase 5: Process Launcher and Agent Main Loop (MVP)
 
-### New Files
+**Objective**: Implement `ProcessUserCodeLauncher` and the agent main loop. This delivers a working MVP where `dagster-agent run` can manage local code location processes.
 
-```
-dagster_webserver/
-├── auth/
-│   └── oidc/
-│       ├── __init__.py           # Public exports
-│       ├── models.py             # OIDCProviderConfig dataclass, session key constants
-│       ├── client.py             # OIDCClient (discovery, PKCE, token exchange, verification)
-│       └── routes.py             # oidc_authorize_endpoint, oidc_callback_endpoint
-├── database/
-│   └── alembic/
-│       └── versions/
-│           └── 002_create_oidc_providers.py  # Migration: oidc_providers table + user OIDC cols
+### Task 5.1: `ProcessUserCodeLauncher` (`user_code_launcher/process.py`)
+
+Implement the simplest launcher — local subprocesses (see `user-code-launcher-design.md §3`):
+
+```python
+class ProcessUserCodeLauncher(DagsterUserCodeLauncher[int], ConfigurableClass):
+    """Spawn local gRPC server subprocesses. Handle type = PID."""
 ```
 
-### Modified Files
+Concrete methods to implement:
 
+- `_start_new_server_spinup()` — Build `dagster api grpc` command, launch subprocess, create Unix socket or find free port, start heartbeat thread.
+- `_wait_for_new_server_ready()` — Poll gRPC client until server responds (with timeout).
+- `_remove_server_handle()` — Stop heartbeat → process dies from timeout.
+- `run_launcher()` — Return `DefaultRunLauncher()`.
+
+Reuse patterns from:
+
+- `dagster_cloud/workspace/user_code_launcher/process.py` (Cloud version)
+- `dagster._core.remote_representation.grpc_server_registry.GrpcServerRegistry` (OSS daemon)
+
+**Outcome**: Process launcher can start, health-check, and stop local gRPC server subprocesses.
+
+### Task 5.2: Agent Main Loop (`agent.py`)
+
+Implement the agent process that ties everything together (see `dagster-cloud-agent-analysis.md §2`):
+
+```python
+class DagsterAgent:
+    def __init__(self, instance: DagsterAgentInstance): ...
+
+    def run_loop(self, user_code_launcher: DagsterUserCodeLauncher) → None:
+        """Main event loop. Runs until KeyboardInterrupt."""
+        # 1. Initial workspace load
+        # 2. Loop: poll requests → classify → dispatch → heartbeat → sleep
+
+    def _poll_workspace(self, user_code_launcher) → None:
+        """Query webserver for workspace entries, feed to launcher."""
+
+    def _pop_requests(self) → list[dict]:
+        """Pop pending requests from the webserver queue."""
+
+    def _classify_requests(self, requests, user_code_launcher) → tuple[list, list]:
+        """Split into ready (server exists) and pending (waiting for server)."""
+
+    def _dispatch_requests(self, requests, user_code_launcher) → None:
+        """Submit ready requests to thread pool executor."""
+
+    def _process_request(self, json_request, user_code_launcher) → dict:
+        """Handle a single API request. Route to handler based on request_api."""
+
+    def _handle_launch_run(self, request, user_code_launcher) → dict: ...
+    def _handle_terminate_run(self, request, user_code_launcher) → dict: ...
+    # ... handlers for all DagsterAgentApi types
+
+    def _send_heartbeat(self) → None:
+        """Report agent health to webserver."""
+
+    def _upload_response(self, request_id, response) → None:
+        """Upload processed request response back to webserver."""
 ```
-dagster_webserver/
-├── pyproject.toml                        # Add auth-oidc optional dependency group
-├── database/
-│   ├── __init__.py                       # Export OIDCProvider
-│   └── models.py                         # Add OIDCProvider model, extend User with OIDC cols
-├── auth/
-│   ├── __init__.py                       # Export HybridSessionAuthProvider
-│   ├── provider.py                       # Add HybridSessionAuthProvider class
-│   ├── routes.py                         # Modify login_endpoint, _render_login for OIDC buttons
-│   └── db_backend.py                     # Add OIDC CRUD methods
-├── admin/
-│   ├── permissions.py                    # Add ADMIN_VIEW_OIDC, ADMIN_EDIT_OIDC + helpers
-│   ├── portal.py                         # Wire OIDCProviderView into AdminPortal
-│   └── views.py                          # Add OIDCProviderView class
-├── auth/roles.py                         # Include OIDC admin permissions in _admin_permissions_for_role()
-└── webserver.py                          # Register OIDC routes in _build_auth_routes()
+
+**Outcome**: Agent main loop runs continuously, polls workspace, processes requests.
+
+### Task 5.3: Request Handlers
+
+Implement handlers for each `DagsterAgentApi` type:
+
+| API | Handler | Implementation |
+| -------------------------------------- | ---------------------------- | -------------------------------------------------------------------- |
+| `LAUNCH_RUN` | `_handle_launch_run` | Get gRPC client from launcher → call `launch_run_from_grpc_client()` |
+| `TERMINATE_RUN` | `_handle_terminate_run` | Get gRPC client → send `CancelExecutionRequest` |
+| `GET_EXTERNAL_EXECUTION_PLAN` | `_handle_execution_plan` | gRPC call to code server |
+| `GET_EXTERNAL_SCHEDULE_EXECUTION_DATA` | `_handle_schedule_execution` | gRPC call with instance ref |
+| `GET_EXTERNAL_SENSOR_EXECUTION_DATA` | `_handle_sensor_execution` | gRPC call with instance ref |
+| `PING_LOCATION` | `_handle_ping` | No-op, updates TTL tracking |
+| `CHECK_FOR_WORKSPACE_UPDATES` | `_handle_workspace_update` | Trigger workspace re-upload |
+
+See `dagster-cloud-agent-analysis.md §3` for the Cloud implementation patterns to follow.
+
+**Outcome**: All request types are handled and responses uploaded to webserver.
+
+### Task 5.4: CLI Integration
+
+Wire up `cli.py run` command to use `DagsterAgentInstance` + `DagsterAgent`:
+
+```python
+@cli.command(name="run")
+def run(dagster_home, log_level):
+    if dagster_home:
+        os.environ["DAGSTER_HOME"] = str(dagster_home)
+
+    with DagsterAgentInstance.get() as instance:
+        launcher = instance.user_code_launcher
+        launcher.start()
+
+        with DagsterAgent(instance) as agent:
+            agent.run_loop(launcher)
 ```
+
+**Outcome**: `dagster-agent run --dagster-home /path/to/config` starts the full agent process.
+
+### Task 5.5: MVP Tests
+
+Create integration tests that verify the MVP works end-to-end:
+
+- Test: Agent starts and connects to webserver (mock).
+- Test: Process launcher spawns a gRPC server subprocess.
+- Test: Agent pops a `LAUNCH_RUN` request and processes it.
+- Test: Heartbeat is submitted to webserver.
+- Test: API key auth validates/rejects keys correctly for service accounts.
+- Test: Per-location role scoping enforces access (403 for unassigned locations).
+
+**Outcome**: CI passes with all MVP tests green.
 
 ______________________________________________________________________
 
-## Design Decisions
+## Phase 6: Daemon Integration (Core)
+
+**Objective**: Enable the daemon to enqueue work through the agent queue. The `enqueue-request` REST endpoint from Phase 2 is already in place; this phase connects the daemon side.
+
+### Task 6.1: Daemon-Side Agent Request Client
+
+Create `dagster_agent/daemon/client.py`:
+
+```python
+class DaemonAgentClient:
+    """Client for the daemon to enqueue work through the agent queue."""
+
+    def __init__(self, webserver_url: str, api_key: str): ...
+
+    async def enqueue_request(self, request_api: str, request_body: dict, location_name: str) → str:
+        """Enqueue a request and return its ID."""
+
+    async def get_request_status(self, request_id: str) → dict:
+        """Poll for request status (for request-reply pattern)."""
+```
+
+Uses `httpx.AsyncClient` with the API key. Calls `/api/agent/enqueue-request`.
+
+**Outcome**: Daemon can enqueue requests to the agent queue.
+
+### Task 6.2: Request-Reply Support in Agent
+
+Extend the agent to support the request-reply pattern needed by the daemon (see `daemon-considerations.md §4`):
+
+- Add a new REST endpoint `/api/agent/request-status/{request_id}` for polling response status.
+- The agent's `_upload_response()` method stores responses in the `response_body` column of `agent_requests`.
+- The daemon client polls this endpoint until the request is completed or failed.
+
+**Outcome**: Daemon can make synchronous (from its perspective) requests through the agent queue.
+
+### Task 6.3: Hybrid Daemon Mode — Run Launching Through Queue
+
+Create a demonstration/wrapper that shows how `QueuedRunCoordinatorDaemon` would enqueue runs instead of launching directly (see `daemon-considerations.md §6`). This doesn't require forking the daemon yet — it's a proof-of-concept module:
+
+```python
+# dagster_agent/daemon/run_coordinator.py
+class AgentRunEnqueuer:
+    """Demonstrates enqueuing runs through the agent queue."""
+
+    def __init__(self, client: DaemonAgentClient): ...
+
+    async def enqueue_run(self, run, location_name: str) → str: ...
+```
+
+**Outcome**: Queue-based run launching is demonstrated and tested end-to-end. Full daemon fork can be created later based on this pattern.
+
+### Task 6.4: Stale Request Re-queuing
+
+Implement background task on the webserver that re-queues expired requests:
+
+- Add to the Starlette lifespan as a periodic background task.
+- Find `agent_requests` with `status='processing'` and `expires_at < NOW()`.
+- Set status back to `'pending'`, clear `assigned_to_agent`.
+
+**Outcome**: Crashed agents don't leave requests permanently stuck.
+
+______________________________________________________________________
+
+## Phase 7: K8s and Docker Launchers (Post-MVP)
+
+**Objective**: Implement additional launcher types for production deployments.
+
+### Task 7.1: `K8sUserCodeLauncher` (`user_code_launcher/k8s.py`)
+
+Deploy code locations as Kubernetes Deployments + Services (see `user-code-launcher-design.md §4`).
+
+**Outcome**: Agent can manage code locations on k8s clusters.
+
+### Task 7.2: `DockerUserCodeLauncher` (`user_code_launcher/docker.py`)
+
+Run code locations as Docker containers (see `user-code-launcher-design.md §5`).
+
+**Outcome**: Agent can manage code locations in Docker.
+
+______________________________________________________________________
+
+## Phase 8: Production Hardening (Post-MVP)
+
+**Objective**: Add production-ready features and polish.
+
+### Task 8.1: Sentinel Files (k8s Probes)
+
+Implement liveness/readiness sentinel file writing (see `agent-instance-design.md §2`):
+
+- Agent writes to `sentinel_dir/liveness` and `sentinel_dir/readiness` on each loop iteration.
+- Configurable via `sentinel_dir` in agent config.
+
+**Outcome**: k8s probes can monitor agent health.
+
+### Task 8.2: Monitoring and Observability
+
+- Structured logging throughout the agent process.
+- Agent metrics (requests processed, server uptime, errors) logged periodically.
+
+**Outcome**: Agent operations are observable.
+
+______________________________________________________________________
+
+## Dependency Graph
+
+```
+Phase 1 (DB Schema + Models) ─────────────┐
+                                           ├──→ Phase 2 (REST API + API Key Auth) ──┐
+Phase 3 (Agent Package Core) ──────────────┤                                         │
+                                           └──→ Phase 4 (Instance + Base) ──────────┤
+                                                                                      ├──→ Phase 5 (MVP: Process Launcher + Main Loop)
+                                                                                       │
+                                                                                       ├──→ Phase 6 (Daemon Integration — Core)
+                                                                                       │
+                                                                                       ├──→ Phase 7 (K8s/Docker Launchers — Post-MVP)
+                                                                                       │
+                                                                                       └──→ Phase 8 (Production Hardening — Post-MVP)
+```
+
+**Critical path to MVP**: Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5
+**Critical path to full queue-based run launching**: Critical path + Phase 6
+
+______________________________________________________________________
+
+## File Change Summary
+
+| File | Action | Phase | Description |
+| ------------------------------------------------------ | ------ | ----- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `database/alembic/versions/003_create_agent_tables.py` | Create | 1 | Migration for 6 new tables + column addition to users + role assignment migration |
+| `database/models.py` | Edit | 1 | Add AgentHeartbeat, AgentRequest, CodeLocationDefinition, CodeLocationSnapshot, ApiKey, UserRoleAssignment models; extend User |
+| `database/agent_queries.py` | Create | 1 | Async helper functions for agent DB operations |
+| `auth/users.py` | Edit | 2 | Add `get_user_by_api_key()` to UserBackend ABC; extend AuthUser with `is_service_account` |
+| `auth/db_backend.py` | Edit | 2 | Implement API key lookup/CRUD, service account creation, per-location role assignment methods |
+| `auth/provider.py` | Edit | 2 | Add API key check to SessionAuthProvider and HybridSessionAuthProvider; remove ApiKeyAuthProvider from provider options |
+| `auth/roles.py` | Edit | 2 | Add `resolve_permissions_for_location()` helper for per-location permission merging |
+| `api/__init__.py` | Create | 2 | Package init |
+| `api/agent.py` | Create | 2 | REST endpoints (7 agent + 4 CRUD handlers) |
+| `api/workspace_loader.py` | Create | 2 | Load workspace entries from YAML and upsert to DB |
+| `admin/views.py` | Edit | 2 | Add code location and service account management views |
+| `admin/templates/code_locations.html` | Create | 2 | Admin portal templates for code locations |
+| `admin/templates/service_accounts.html` | Create | 2 | Admin portal templates for service accounts & API keys |
+| `webserver.py` | Edit | 2 | Mount agent API router in build_routes() |
+| `cli.py` | Edit | 2 | Remove `--auth-provider=api-key`; add service account and API key management subcommands |
+| `pyproject.toml` | Edit | 3 | Add dagster_agent package + CLI entry point |
+| `dagster_agent/__init__.py` | Create | 3 | Package init |
+| `dagster_agent/api/types.py` | Create | 3 | Core data types (DagsterAgentApi, AgentRequest, etc.) |
+| `dagster_agent/api/client.py` | Create | 3 | HTTP client for webserver REST API |
+| `dagster_agent/cli.py` | Create | 3 | CLI entry point |
+| `dagster_agent/instance.py` | Create | 4 | DagsterAgentInstance class |
+| `dagster_agent/user_code_launcher/__init__.py` | Create | 4 | Package init, exports |
+| `dagster_agent/user_code_launcher/base.py` | Create | 4 | DagsterUserCodeLauncher abstract base |
+| `dagster_agent/user_code_launcher/process.py` | Create | 5 | ProcessUserCodeLauncher |
+| `dagster_agent/agent.py` | Create | 5 | DagsterAgent main class + request handlers |
+| `dagster_agent/daemon/client.py` | Create | 6 | DaemonAgentClient for enqueueing requests |
+| `dagster_agent/daemon/run_coordinator.py` | Create | 6 | AgentRunEnqueuer proof-of-concept |
+| `dagster_agent/user_code_launcher/k8s.py` | Create | 7 | K8sUserCodeLauncher |
+| `dagster_agent/user_code_launcher/docker.py` | Create | 7 | DockerUserCodeLauncher |
+
+______________________________________________________________________
+
+## Decisions Made (from Q&A)
 
 | Question | Decision |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Library** | Authlib + httpx (optional `auth-oidc` extra). Authlib provides OIDC discovery, JWT verification, JWKS. httpx provides async HTTP. See `/.agent/research/11-oidc-login-research.md §4` for rationale. |
-| **Provider class** | `HybridSessionAuthProvider` extends `SessionAuthProvider`. Password login unchanged. OIDC login adds two new methods + two new routes. |
-| **Session state** | OIDC flow state (state, verifier, nonce, redirect) stored in `request.session` using defined key constants. Cleared after successful callback. |
-| **User provisioning** | Auto-provision on first login with `config.default_role`. Account linking via email match. See `/.agent/research/11-oidc-login-research.md §8`. |
-| **Username for OIDC users** | Prefer `email` from ID token. Fallback: `oidc_{provider_name}_{sub}`. |
-| **Password for OIDC users** | `password_hash` set to empty string. Once a user logs in via OIDC, that becomes their only login method. No dual-auth. Existing password users can link OIDC via email match. |
-| **Post-login redirect** | The `next` parameter from the authorize URL is stored in session and used after successful callback. Validated as a relative path (open redirect prevention). |
-| **Logout** | Logout is scoped to Dagster webserver only. No RP-initiated OIDC logout. |
-| **Default role** | Single `config.default_role` used for both password and OIDC auto-provisioned users. No separate OIDC role flag. |
-| **Multiple providers** | Each provider has a unique `name`. Login page shows buttons for all enabled providers. State parameter encodes provider name for callback routing. |
-| **Client secret storage** | Plain text in database (encrypted at rest via DB-level encryption or env-level secrets). Masked in admin UI. See `/.agent/research/11-oidc-login-research.md §10.4`. |
-| **OIDC admin permissions** | `ADMIN_VIEW_OIDC` and `ADMIN_EDIT_OIDC` added to `AdminPermission` enum. Only `ADMIN` role gets them enabled. |
-| **Admin user count** | `OIDCProviderView` list and detail views show `user_count` (number of users linked to each provider) via eager-loaded `users` relationship. |
-| **Backward compatibility** | All changes are additive. OIDC routes only registered when `HybridSessionAuthProvider` is used. `authlib`/`httpx` are optional. Existing password login unchanged. |
-| **Open redirect prevention** | The `next` parameter in OIDC redirect is validated: must be relative path starting with `/`, no `//` or protocol schemes. |
-
-______________________________________________________________________
-
-## Design Decisions (Resolved)
-
-| Question | Decision |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| **Dual-auth (OIDC + password)** | Not supported. Once a user logs in via OIDC, that becomes their only login method. Existing password users can link OIDC via email match. |
-| **Post-login redirect** | The `next` parameter from the authorize URL is preserved in the session and used after successful callback. Validated as a relative path. |
-| **RP-initiated logout** | Not implemented. Logout is scoped to Dagster webserver only. |
-| **Default role** | Single `config.default_role` for all users (password and OIDC). No separate OIDC role. |
-| **Admin user count** | `OIDCProviderView` shows `user_count` per provider via eager-loaded `users` relationship. |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agent package location | Lives in this repo under `dagster_agent/`, same `pyproject.toml` |
+| Agent communication protocol | REST endpoints (`/api/agent/*`) — no GraphQL schema extension needed |
+| Agent authentication | Service accounts (users with `is_service_account=True`) authenticate via API keys. Single user model, existing RBAC roles extended with per-location assignments via `user_role_assignments` junction table. Regular users can also have API keys for programmatic access. API key auth is integrated into all provider types (not a separate provider). |
+| Snapshot storage | BYTEA in PostgreSQL for now. Swappable later via `SnapshotStorage` abstract class. |
+| Daemon integration scope | Queue infrastructure is core (Phase 2 + Phase 6). Full daemon fork is post-MVP. |
+| Workspace entry source | Database (primary) + optional `workspace.yaml` loading for backcompat (Phase 2.6). |
