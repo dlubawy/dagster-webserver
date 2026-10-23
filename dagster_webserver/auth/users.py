@@ -42,6 +42,8 @@ class AuthUser:
         display_name: Optional human-readable name.
         oidc_sub: OIDC subject identifier if the user is linked to an OIDC
             provider. ``None`` for password-only users.
+        is_service_account: True if this user is a service account that can
+            only authenticate via API key.
     """
 
     username: str
@@ -50,6 +52,7 @@ class AuthUser:
     email: str | None = None
     display_name: str | None = None
     oidc_sub: str | None = None
+    is_service_account: bool = False
 
 
 class UserBackend(ABC):
@@ -68,6 +71,14 @@ class UserBackend(ABC):
     async def get_user(self, username: str) -> AuthUser | None:
         """Look up user by username (e.g. from session)."""
         ...
+
+    async def get_user_by_api_key(self, api_key: str) -> AuthUser | None:
+        """Look up a user by their API key.
+
+        The key is hashed (SHA-256) and matched against stored key hashes.
+        Returns the ``AuthUser`` if the key is valid and active, else ``None``.
+        """
+        return None  # Default: not supported
 
 
 def _hash_password(password: str) -> str:

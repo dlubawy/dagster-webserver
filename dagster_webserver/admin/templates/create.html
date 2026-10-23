@@ -2,9 +2,9 @@
 {% block title %}Create {{ view.label }} — Dagster Admin{% endblock %}
 {% block content %}
 <div class="actions-bar">
-  <h2 style="flex: 1;">Create {{ view.label }}</h2>
+  <h2 class="page-title" style="flex: 1; margin-bottom: 0;">Create {{ view.label }}</h2>
   <a href="/admin/{{ view.identity }}/list" class="btn btn-secondary">
-    <i class="fas fa-arrow-left"></i> Back to list
+    {{ icon("arrow-left", 14) }} Back to list
   </a>
 </div>
 
@@ -31,14 +31,33 @@
       </option>
       {% endfor %}
     </select>
+    {% elif field == 'expires_in_days' %}
+    <input type="number" id="{{ field }}" name="{{ field }}" min="1"
+           placeholder="Leave empty for no expiry"
+           value="{{ form.get(field, '') if form else '' }}"/>
+    {% elif field == 'username' and view.identity == 'api-keys' %}
+    <select id="{{ field }}" name="{{ field }}" required>
+      <option value="">Select a user…</option>
+      {% for u in users_list %}
+      <option value="{{ u }}"{% if (form.get(field, '') if form else '') == u %} selected{% endif %}>{{ u }}</option>
+      {% endfor %}
+    </select>
     {% else %}
     <input type="{% if field == 'email' %}email{% else %}text{% endif %}"
            id="{{ field }}" name="{{ field }}"
-           {% if field == 'username' %}required{% endif %}
+           {% if field in ('username', 'location_name') %}required{% endif %}
            value="{{ form.get(field, '') if form else '' }}"/>
     {% endif %}
   </div>
   {% endfor %}
+
+  {# Role assignments widget for users and service accounts #}
+  {% if view.identity in ('users', 'service-accounts') %}
+  <div class="form-group">
+    <label>Role Assignments</label>
+    {% include "_role_assignments.html" %}
+  </div>
+  {% endif %}
 
   <button type="submit" class="btn btn-primary">Create {{ view.label }}</button>
 </form>

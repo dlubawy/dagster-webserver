@@ -30,9 +30,12 @@ from starlette.templating import Jinja2Templates
 
 from dagster_webserver.admin.permissions import has_any_admin_permission
 from dagster_webserver.admin.views import (
+    ApiKeyView,
     BaseAdminView,
+    CodeLocationView,
     OIDCProviderView,
     RoleView,
+    ServiceAccountView,
     UserView,
 )
 
@@ -40,6 +43,27 @@ if TYPE_CHECKING:
     from dagster_webserver.auth.db_backend import DatabaseUserBackend
 
 logger = logging.getLogger("dagster-webserver.admin")
+
+
+def _template_get_pk(item: dict, identity: str) -> str:
+    """Jinja2 helper: extract the primary key from a serialized item.
+
+    Different views use different PK field names:
+    - users / service-accounts → username
+    - roles / oidc → name
+    - api-keys → id (integer, stored as 'id' in serialized dict)
+    - code-locations → location_name
+    """
+    if identity in ("users", "service-accounts"):
+        return item.get("username", "")
+    if identity == "api-keys":
+        # The serialized dict doesn't include 'id' directly, but we need it
+        # for row actions. We'll use a special key.
+        return str(item.get("_pk", item.get("name", "")))
+    if identity == "code-locations":
+        return item.get("location_name", "")
+    # Default: roles, oidc
+    return item.get("name", "")
 
 
 # ---------------------------------------------------------------------------
@@ -119,12 +143,21 @@ class AdminPortal:
             loader=FileSystemLoader(templates_dir),
             autoescape=True,
         )
+        # Template helper: extract PK from a serialized item based on view identity
+        env.globals["_get_pk"] = _template_get_pk
+        # Inline Dagster SVG icons (replaces the Font Awesome CDN dependency)
+        from dagster_webserver.admin.icons import icon
+
+        env.globals["icon"] = icon
         self._templates = Jinja2Templates(env=env)
 
     def _init_views(self) -> None:
         self._views = [
             UserView(self.backend),
+            ServiceAccountView(self.backend),
+            ApiKeyView(self.backend),
             RoleView(self.backend),
+            CodeLocationView(self.backend),
             OIDCProviderView(self.backend),
         ]
 
@@ -254,6 +287,18 @@ class AdminPortal:
         serialized = await view.serialize(obj, request, "detail")
         row_actions = await view.get_all_row_actions(request)
 
+        # Fetch role assignments for users/service-accounts detail page
+        role_assignments: list[dict] = []
+        if view.identity in ("users", "service-accounts"):
+            assignments = await self.backend.get_user_role_assignments(pk)
+            role_assignments = [
+                {
+                    "role_name": a.role.name if a.role else "?",
+                    "code_location_name": a.code_location_name,
+                }
+                for a in assignments
+            ]
+
         return self._templates.TemplateResponse(
             request=request,
             name="detail.html",
@@ -263,6 +308,7 @@ class AdminPortal:
                 "obj": serialized,
                 "pk": pk,
                 "row_actions": row_actions,
+                "role_assignments": role_assignments,
                 "user": getattr(request.state, "user", None),
             },
         )
@@ -274,10 +320,18 @@ class AdminPortal:
             raise HTTPException(HTTP_403)
 
         if request.method == "GET":
-            # Fetch available roles for the role dropdown (users view only)
-            roles = []
-            if view.identity == "users":
+            # Fetch available roles and code locations for role assignments
+            roles: list[str] = []
+            location_names: list[str] = []
+            if view.identity in ("users", "service-accounts"):
                 roles = [r.name for r in await self.backend.list_roles()]
+                code_locs = await self.backend.list_code_locations(status="active")
+                location_names = [loc.location_name for loc in code_locs]
+            # Fetch user list for API key creation dropdown
+            users_list: list[str] = []
+            if view.identity == "api-keys":
+                all_users = await self.backend.list_users()
+                users_list = [u.username for u in all_users]
             return self._templates.TemplateResponse(
                 request=request,
                 name="create.html",
@@ -285,17 +339,27 @@ class AdminPortal:
                     "view": view,
                     "views": self._views,
                     "roles": roles,
+                    "location_names": location_names,
+                    "initial_assignments": [],
+                    "users_list": users_list,
                     "user": getattr(request.state, "user", None),
                 },
             )
 
         form = await request.form()
         try:
-            await view.create(request, dict(form))
+            result = await view.create(request, dict(form))
         except ValueError as e:
             roles = []
-            if view.identity == "users":
+            location_names: list[str] = []
+            if view.identity in ("users", "service-accounts"):
                 roles = [r.name for r in await self.backend.list_roles()]
+                code_locs = await self.backend.list_code_locations(status="active")
+                location_names = [loc.location_name for loc in code_locs]
+            users_list: list[str] = []
+            if view.identity == "api-keys":
+                all_users = await self.backend.list_users()
+                users_list = [u.username for u in all_users]
             return self._templates.TemplateResponse(
                 request=request,
                 name="create.html",
@@ -304,11 +368,18 @@ class AdminPortal:
                     "views": self._views,
                     "form": dict(form),
                     "roles": roles,
+                    "location_names": location_names,
+                    "initial_assignments": [],
+                    "users_list": users_list,
                     "error": str(e),
                     "user": getattr(request.state, "user", None),
                 },
                 status_code=HTTP_400_BAD_REQUEST,
             )
+
+        # Allow views to return a custom Response (e.g. show API key once)
+        if isinstance(result, Response):
+            return result
 
         url = str(request.url_for("admin:admin-list", identity=view.identity))
         return RedirectResponse(url, status_code=HTTP_303_SEE_OTHER)
@@ -326,10 +397,22 @@ class AdminPortal:
 
         if request.method == "GET":
             serialized = await view.serialize(obj, request, "edit")
-            # Fetch available roles for the role dropdown (users view only)
-            roles = []
-            if view.identity == "users":
+            # Fetch available roles and code locations
+            roles: list[str] = []
+            location_names: list[str] = []
+            initial_assignments: list[dict] = []
+            if view.identity in ("users", "service-accounts"):
                 roles = [r.name for r in await self.backend.list_roles()]
+                assignments = await self.backend.get_user_role_assignments(pk)
+                initial_assignments = [
+                    {
+                        "role_name": a.role.name if a.role else "?",
+                        "code_location_name": a.code_location_name,
+                    }
+                    for a in assignments
+                ]
+                code_locs = await self.backend.list_code_locations(status="active")
+                location_names = [loc.location_name for loc in code_locs]
             return self._templates.TemplateResponse(
                 request=request,
                 name="edit.html",
@@ -339,6 +422,8 @@ class AdminPortal:
                     "obj": serialized,
                     "pk": pk,
                     "roles": roles,
+                    "initial_assignments": initial_assignments,
+                    "location_names": location_names,
                     "user": getattr(request.state, "user", None),
                 },
             )
@@ -349,8 +434,20 @@ class AdminPortal:
         except ValueError as e:
             serialized = await view.serialize(obj, request, "edit")
             roles = []
-            if view.identity == "users":
+            location_names: list[str] = []
+            initial_assignments: list[dict] = []
+            if view.identity in ("users", "service-accounts"):
                 roles = [r.name for r in await self.backend.list_roles()]
+                assignments = await self.backend.get_user_role_assignments(pk)
+                initial_assignments = [
+                    {
+                        "role_name": a.role.name if a.role else "?",
+                        "code_location_name": a.code_location_name,
+                    }
+                    for a in assignments
+                ]
+                code_locs = await self.backend.list_code_locations(status="active")
+                location_names = [loc.location_name for loc in code_locs]
             return self._templates.TemplateResponse(
                 request=request,
                 name="edit.html",
@@ -361,6 +458,8 @@ class AdminPortal:
                     "pk": pk,
                     "form": dict(form),
                     "roles": roles,
+                    "initial_assignments": initial_assignments,
+                    "location_names": location_names,
                     "error": str(e),
                     "user": getattr(request.state, "user", None),
                 },

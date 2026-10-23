@@ -236,16 +236,13 @@ def dagster_webserver(ctx: click.Context, **_kwargs: object):
 # -- Auth options --
 @click.option(
     "--auth-provider",
-    type=click.Choice(
-        ["session", "api-key", "database", "hybrid", "none"], case_sensitive=False
-    ),
+    type=click.Choice(["session", "database", "hybrid", "none"], case_sensitive=False),
     default="none",
     help=(
         "Authentication provider to use. "
-        "'session' uses cookie-based sessions with username/password. "
-        "'api-key' uses Bearer token auth. "
-        "'database' uses cookie-based sessions backed by a database. "
-        "'hybrid' uses cookie-based sessions backed by a database with OIDC support. "
+        "'session' uses cookie-based sessions with username/password (also supports API keys). "
+        "'database' uses cookie-based sessions backed by a database (also supports API keys). "
+        "'hybrid' uses cookie-based sessions backed by a database with OIDC support (also supports API keys). "
         "'none' disables auth (default)."
     ),
 )
@@ -302,6 +299,30 @@ def dagster_webserver(ctx: click.Context, **_kwargs: object):
         "if not specified."
     ),
 )
+@click.option(
+    "--agent-workspaces",
+    is_flag=True,
+    default=False,
+    envvar="DAGSTER_WEBSERVER_AGENT_WORKSPACES",
+    help=(
+        "Load code locations from agent-managed workspaces. "
+        "Queries the database for gRPC endpoints reported by agents via heartbeats "
+        "and builds the workspace from those. Requires --auth-database-url. "
+        "Mutually exclusive with explicit workspace options (--workspace, --module-name, etc.)."
+    ),
+)
+@click.option(
+    "--agent-workspace-file",
+    type=click.Path(),
+    default=None,
+    envvar="DAGSTER_AGENT_WORKSPACE_FILE",
+    help=(
+        "Path to a YAML file that the webserver will maintain with current "
+        "agent-managed code locations. External processes like dagster-daemon "
+        "can use this via --workspace. Defaults to <instance.root_directory>/"
+        "agent_workspace.yaml when --agent-workspaces is set."
+    ),
+)
 @workspace_options
 def start(
     host: str,
@@ -326,6 +347,8 @@ def start(
     default_role: str,
     enable_admin_portal: bool,
     admin_database_url: str | None,
+    agent_workspaces: bool,
+    agent_workspace_file: str | None,
     **other_opts: object,
 ):
     """Start the Dagster webserver."""
@@ -382,23 +405,68 @@ def start(
             admin_database_url=admin_database_url,
         )
 
+        # -- Determine workspace load target --
+        agent_refresher = None
+        if agent_workspaces:
+            from dagster_webserver.api.agent_workspace import (
+                AgentWorkspaceRefresher,
+                DynamicAgentWorkspaceTarget,
+            )
+
+            db_url = admin_database_url or auth_database_url
+            if not db_url:
+                raise click.ClickException(
+                    "--agent-workspaces requires --auth-database-url (or --admin-database-url)."
+                )
+            # Dynamic target: re-queries DB on each workspace reload,
+            # filtering out stale heartbeats. Starts empty and fills in
+            # as agents report their locations.
+            workspace_load_target = DynamicAgentWorkspaceTarget(db_url=db_url)
+        else:
+            workspace_load_target = workspace_opts_to_load_target(workspace_opts)
+
         with WorkspaceProcessContext(
             instance,
             version=__version__,
             read_only=read_only,
-            workspace_load_target=workspace_opts_to_load_target(workspace_opts),
+            workspace_load_target=workspace_load_target,
             code_server_log_level=code_server_log_level,
         ) as workspace_process_context:
-            host_dagster_ui_with_workspace_process_context(
-                workspace_process_context,
-                host,
-                port,
-                path_prefix,
-                uvicorn_log_level,
-                live_data_poll_rate,
-                auth_provider=auth_provider_instance,
-                admin_portal=admin_portal_instance,
-            )
+            # Start periodic workspace refresher for agent-managed locations
+            if agent_workspaces:
+                # Determine workspace file path for external consumers (daemon).
+                # Use the instance's root_directory which works whether DAGSTER_HOME
+                # is explicitly set or a temp dir was created by get_possibly_temporary_instance_for_cli.
+                ws_file = agent_workspace_file
+                if ws_file is None:
+                    ws_file = os.path.join(
+                        instance.root_directory, "agent_workspace.yaml"
+                    )
+                agent_refresher = AgentWorkspaceRefresher(
+                    workspace_process_context,
+                    db_url=db_url,
+                    workspace_file_path=ws_file,
+                )
+                agent_refresher.start()
+                logger.info(
+                    "Agent workspace file: %s (use with dagster-daemon --workspace)",
+                    ws_file,
+                )
+
+            try:
+                host_dagster_ui_with_workspace_process_context(
+                    workspace_process_context,
+                    host,
+                    port,
+                    path_prefix,
+                    uvicorn_log_level,
+                    live_data_poll_rate,
+                    auth_provider=auth_provider_instance,
+                    admin_portal=admin_portal_instance,
+                )
+            finally:
+                if agent_refresher is not None:
+                    agent_refresher.stop()
 
 
 @contextlib.asynccontextmanager
@@ -534,7 +602,6 @@ def _build_auth_provider(
         return None
 
     from dagster_webserver.auth.provider import (
-        ApiKeyAuthProvider,
         AuthConfig,
         SessionAuthProvider,
     )
@@ -633,9 +700,6 @@ def _build_auth_provider(
         config._session_secret = session_secret  # type: ignore[attr-defined]
         return SessionAuthProvider(user_backend, config=config)
 
-    if auth_provider == "api-key":
-        return ApiKeyAuthProvider(user_backend, config=config)
-
     raise click.BadParameter(f"Unknown auth provider: {auth_provider}")
 
 
@@ -654,7 +718,6 @@ def db_cli():
 @click.option("--username", required=True, help="Admin username.")
 @click.option("--password", required=True, help="Admin password.")
 @click.option(
-    "--database-url",
     "--database-url",
     envvar="DAGSTER_AUTH_DATABASE_URL",
     required=True,
@@ -834,6 +897,219 @@ def _get_alembic_config(database_url: str):
     # Ensure script_location is absolute so Alembic finds env.py
     config.set_main_option("script_location", alembic_dir)
     return config
+
+
+@db_cli.command(
+    name="create-service-account",
+    help="Create a service account (agent user that authenticates via API key).",
+)
+@click.option("--username", required=True, help="Service account username.")
+@click.option(
+    "--role",
+    default="viewer",
+    help="Role to assign globally (default: viewer). Use 'assign-role' for per-location roles.",
+)
+@click.option("--display-name", default=None, help="Human-readable display name.")
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_create_service_account(
+    username: str, role: str, display_name: str | None, database_url: str
+) -> None:
+    """Create a service account user."""
+    try:
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+    except ImportError as exc:
+        raise click.UsageError(
+            "Database auth requires optional dependencies. Install with:\n"
+            "  pip install dagster-webserver[auth]"
+        ) from exc
+
+    backend = DatabaseUserBackend(database_url, create_tables=True)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(
+            backend.create_service_account(
+                username, role_name=role, display_name=display_name
+            )
+        )
+    finally:
+        loop.close()
+    click.echo(f"Service account '{username}' created with role '{role}'.")
+
+
+@db_cli.command(
+    name="assign-role",
+    help="Assign a role to a user, optionally scoped to a code location.",
+)
+@click.option("--user", required=True, help="Username.")
+@click.option("--role", required=True, help="Role name to assign.")
+@click.option(
+    "--location",
+    default=None,
+    help="Code location name (omit for global assignment).",
+)
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_assign_role(
+    user: str, role: str, location: str | None, database_url: str
+) -> None:
+    """Assign a role to a user, optionally scoped to a code location."""
+    try:
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+    except ImportError as exc:
+        raise click.UsageError(
+            "Database auth requires optional dependencies. Install with:\n"
+            "  pip install dagster-webserver[auth]"
+        ) from exc
+
+    backend = DatabaseUserBackend(database_url, create_tables=True)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(
+            backend.assign_role_to_location(user, role, code_location_name=location)
+        )
+    finally:
+        loop.close()
+    scope = f" (location: {location})" if location else " (global)"
+    click.echo(f"Role '{role}' assigned to '{user}'{scope}.")
+
+
+@db_cli.command(
+    name="create-api-key",
+    help="Create an API key for a user. The plaintext key is shown once.",
+)
+@click.option("--user", required=True, help="Username the key belongs to.")
+@click.option("--name", required=True, help="Human-readable label for the key.")
+@click.option(
+    "--expires-in",
+    default=None,
+    help="Expiration (e.g. '90d', '30d'). Omit for no expiration.",
+)
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_create_api_key(
+    user: str, name: str, expires_in: str | None, database_url: str
+) -> None:
+    """Create a new API key and display the plaintext value once."""
+    try:
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+    except ImportError as exc:
+        raise click.UsageError(
+            "Database auth requires optional dependencies. Install with:\n"
+            "  pip install dagster-webserver[auth]"
+        ) from exc
+
+    expires_days = None
+    if expires_in:
+        # Parse simple formats like '90d'
+        if expires_in.endswith("d"):
+            expires_days = int(expires_in[:-1])
+        else:
+            raise click.BadParameter(
+                "--expires-in must end with 'd' (days), e.g. '90d'"
+            )
+
+    backend = DatabaseUserBackend(database_url, create_tables=True)
+    loop = asyncio.new_event_loop()
+    try:
+        _, plaintext_key = loop.run_until_complete(
+            backend.create_api_key(user, name, expires_in_days=expires_days)
+        )
+    finally:
+        loop.close()
+    click.echo(f"API key '{name}' created for user '{user}'.")
+    click.echo("")
+    click.echo(f"  Key: {plaintext_key}")
+    click.echo("")
+    click.echo("  Store this key securely — it will not be shown again.")
+
+
+@db_cli.command(
+    name="list-api-keys",
+    help="List API keys for a user.",
+)
+@click.option("--user", required=True, help="Username.")
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_list_api_keys(user: str, database_url: str) -> None:
+    """List all API keys for a user."""
+    try:
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+    except ImportError as exc:
+        raise click.UsageError(
+            "Database auth requires optional dependencies. Install with:\n"
+            "  pip install dagster-webserver[auth]"
+        ) from exc
+
+    backend = DatabaseUserBackend(database_url, create_tables=True)
+    loop = asyncio.new_event_loop()
+    try:
+        keys = loop.run_until_complete(backend.list_api_keys(user))
+    finally:
+        loop.close()
+
+    if not keys:
+        click.echo(f"No API keys for user '{user}'.")
+        return
+
+    click.echo(f"API keys for '{user}':")
+    for key in keys:
+        status = "active" if key.is_active else "revoked"
+        expires = f" (expires {key.expires_at:%Y-%m-%d})" if key.expires_at else ""
+        last_used = (
+            f" (last used {key.last_used_at:%Y-%m-%d})" if key.last_used_at else ""
+        )
+        click.echo(f"  [{key.id}] {key.name} — {status}{expires}{last_used}")
+
+
+@db_cli.command(
+    name="revoke-api-key",
+    help="Revoke (deactivate) an API key.",
+)
+@click.option("--key-id", required=True, type=int, help="API key ID.")
+@click.option(
+    "--database-url",
+    envvar="DAGSTER_AUTH_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy URL for the auth database.",
+)
+def db_revoke_api_key(key_id: int, database_url: str) -> None:
+    """Deactivate an API key."""
+    try:
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+    except ImportError as exc:
+        raise click.UsageError(
+            "Database auth requires optional dependencies. Install with:\n"
+            "  pip install dagster-webserver[auth]"
+        ) from exc
+
+    backend = DatabaseUserBackend(database_url, create_tables=True)
+    loop = asyncio.new_event_loop()
+    try:
+        success = loop.run_until_complete(backend.revoke_api_key(key_id))
+    finally:
+        loop.close()
+
+    if success:
+        click.echo(f"API key {key_id} revoked.")
+    else:
+        click.echo(f"API key {key_id} not found.", err=True)
 
 
 @db_cli.command(

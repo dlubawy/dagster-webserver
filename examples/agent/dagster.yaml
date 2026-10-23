@@ -1,0 +1,77 @@
+# Example dagster.yaml configuration for running a Dagster agent.
+# Place this in your DAGSTER_HOME directory.
+#
+# Usage:
+#   export DAGSTER_HOME=/path/to/this/directory
+#   dagster-agent run
+
+agent:
+  # URL of the dagster-webserver instance
+  webserver_url: http://localhost:3005
+
+  # API key for a service account (create with:
+  #   dagster-webserver db create-service-account --username my-agent --role launcher
+  #   dagster-webserver db create-api-key --user my-agent --name "agent-key"
+  api_key: "your-api-key-here"
+
+  # Labels for routing — the agent only receives requests matching these labels.
+  # Empty/omitted = agent handles all unscoped requests.
+  labels:
+    region: us-east-1
+    env: production
+
+  # Code locations this agent is allowed to manage.
+  # Empty list or omitted = all locations.
+  allowed_locations: []
+  # allowed_locations:
+  #   - my-first-location
+  #   - etl-pipelines
+
+  # How often to poll for new work requests (seconds)
+  poll_interval_seconds: 5
+
+  # How often to send health heartbeats (seconds)
+  heartbeat_interval_seconds: 30
+
+  # Timeout for individual request processing (seconds)
+  request_timeout_seconds: 300
+
+  # Directory for liveness/readiness sentinel files (for k8s probes).
+  # The agent writes to {sentinel_dir}/liveness every 10s and maintains
+  # {sentinel_dir}/readiness while at least one location is serving.
+  # Omit or set to null to disable.
+  # sentinel_dir: /var/run/dagster-agent/sentinels
+
+  # How often to log agent metrics (requests, errors, uptime) (seconds)
+  metrics_log_interval_seconds: 60
+
+  # User code launcher configuration
+  user_code_launcher:
+    # Supported types: process, docker, k8s
+    type: process
+    config:
+      # Seconds to wait for gRPC server startup
+      server_process_startup_timeout: 60
+      # Optional: restrict port range for gRPC servers
+      # server_port_range: [5000, 5100]
+      # Additional environment variables for child processes
+      # extra_env:
+      #   MY_CUSTOM_VAR: "value"
+
+  # --- Docker launcher example ---
+  # user_code_launcher:
+  #   type: docker
+  #   config:
+  #     image_registry: ghcr.io/my-org/
+  #     default_image: dagster-code-server
+  #     default_env:
+  #       PYTHONUNBUFFERED: "1"
+
+  # --- K8s launcher example ---
+  # user_code_launcher:
+  #   type: k8s
+  #   config:
+  #     namespace: dagster
+  #     image_registry: ghcr.io/my-org/
+  #     default_image: dagster-code-server
+  #     service_account_name: dagster-agent

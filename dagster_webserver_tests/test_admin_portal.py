@@ -152,7 +152,7 @@ class TestAdminPermissionEnum:
         assert AdminPermission.ADMIN_EDIT_OIDC.value == "admin_edit_oidc"
 
     def test_enum_count(self):
-        assert len(AdminPermission) == 6
+        assert len(AdminPermission) == 8
 
 
 # ---------------------------------------------------------------------------
@@ -844,3 +844,219 @@ class TestPasswordReset:
         backend = DatabaseUserBackend("sqlite+aiosqlite:///:memory:")
         view = UserView(backend)
         assert "reset_password" in view._row_actions
+
+
+# ---------------------------------------------------------------------------
+# Code location image field (k8s/docker launchers)
+# ---------------------------------------------------------------------------
+
+
+class TestCodeLocationImageField:
+    """The admin view must expose the container image used by k8s/docker launchers."""
+
+    def _make_app(self):
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from dagster_webserver.admin import AdminPortal, AdminPortalMiddleware
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+        from dagster_webserver.auth.users import AuthUser
+
+        backend = DatabaseUserBackend("sqlite+aiosqlite:///:memory:")
+        portal = AdminPortal(backend)
+        admin_app = Starlette(
+            routes=portal.routes,
+            middleware=[Middleware(AdminPortalMiddleware)],
+        )
+
+        def fake_auth_middleware(request, call_next):
+            request.state.user = AuthUser(
+                username="admin", email="admin@test.com", role="admin"
+            )
+            return call_next(request)
+
+        admin_app.add_middleware(BaseHTTPMiddleware, dispatch=fake_auth_middleware)
+        admin_app.state.ROUTE_NAME = "admin"
+        app = Starlette(routes=[Mount("/admin", app=admin_app, name="admin")])
+        return TestClient(app), backend
+
+    def test_create_fields_include_image(self):
+        from dagster_webserver.admin.views import CodeLocationView
+
+        view = CodeLocationView(None)
+        assert "image" in view.create_fields
+        assert "image" in view.edit_fields
+        assert "image" in view.list_columns
+
+    def test_create_code_location_with_image(self):
+        client, _ = self._make_app()
+        resp = client.post(
+            "/admin/code-locations/create",
+            data={
+                "location_name": "my-container-loc",
+                "image": "myreg/my-dagster-image:1.0",
+                "python_file": "/opt/repo/definitions.py",
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code in (302, 303), resp.text[:500]
+
+        list_resp = client.get("/admin/code-locations/list")
+        assert "myreg/my-dagster-image:1.0" in list_resp.text
+
+    def test_create_code_location_image_alone_is_rejected(self):
+        """Container launchers still need a code pointer inside the image."""
+        client, _ = self._make_app()
+        resp = client.post(
+            "/admin/code-locations/create",
+            data={"location_name": "no-code-pointer", "image": "some/image:latest"},
+            follow_redirects=True,
+        )
+        assert "python_file" in resp.text or "module_name" in resp.text
+
+    def test_edit_code_location_image(self):
+        client, _ = self._make_app()
+        client.post(
+            "/admin/code-locations/create",
+            data={
+                "location_name": "edit-me",
+                "image": "old/image:1",
+                "module_name": "my_defs",
+            },
+            follow_redirects=False,
+        )
+
+        resp = client.post(
+            "/admin/code-locations/edit/edit-me",
+            data={
+                "image": "new/image:2",
+                "module_name": "my_defs",
+                "status": "",
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code in (302, 303), resp.text[:500]
+
+        list_resp = client.get("/admin/code-locations/list")
+        assert "new/image:2" in list_resp.text
+        assert "old/image:1" not in list_resp.text
+
+
+class TestCodeLocationDeleteAndStatus:
+    """Deletion is a hard delete; status drives agent behaviour (pause/resume)."""
+
+    def _make_app(self):
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.routing import Mount
+        from starlette.testclient import TestClient
+
+        from dagster_webserver.admin import AdminPortal, AdminPortalMiddleware
+        from dagster_webserver.auth.db_backend import DatabaseUserBackend
+        from dagster_webserver.auth.users import AuthUser
+
+        backend = DatabaseUserBackend("sqlite+aiosqlite:///:memory:")
+        portal = AdminPortal(backend)
+        admin_app = Starlette(
+            routes=portal.routes,
+            middleware=[Middleware(AdminPortalMiddleware)],
+        )
+
+        def fake_auth_middleware(request, call_next):
+            request.state.user = AuthUser(
+                username="admin", email="admin@test.com", role="admin"
+            )
+            return call_next(request)
+
+        admin_app.add_middleware(BaseHTTPMiddleware, dispatch=fake_auth_middleware)
+        admin_app.state.ROUTE_NAME = "admin"
+        app = Starlette(routes=[Mount("/admin", app=admin_app, name="admin")])
+        return TestClient(app), backend
+
+    def _create(self, client, name="del-me"):
+        resp = client.post(
+            "/admin/code-locations/create",
+            data={"location_name": name, "python_file": "main.py"},
+            follow_redirects=False,
+        )
+        assert resp.status_code in (302, 303), resp.text[:500]
+
+    def _workspace_entry_names(self) -> list[str]:
+        import asyncio
+
+        from dagster_webserver.database import get_session_factory
+        from dagster_webserver.database.agent_queries import get_workspace_entries
+
+        async def _fetch():
+            async with get_session_factory()() as session:
+                return [loc.location_name for loc in await get_workspace_entries(session)]
+
+        return asyncio.run(_fetch())
+
+    def test_delete_is_hard_delete(self):
+        """Deleting a code location removes the row, not just sets a status."""
+        client, _ = self._make_app()
+        self._create(client, "hard-delete-me")
+        assert "hard-delete-me" in self._workspace_entry_names()
+
+        resp = client.post(
+            "/admin/code-locations/row-action",
+            data={"action_name": "delete", "pk": "hard-delete-me"},
+            follow_redirects=False,
+        )
+        assert resp.status_code in (302, 303), resp.text[:500]
+
+        list_resp = client.get("/admin/code-locations/list")
+        assert "hard-delete-me" not in list_resp.text
+        assert "hard-delete-me" not in self._workspace_entry_names()
+
+    def test_paused_location_excluded_from_workspace_entries(self):
+        """Paused locations stay in the DB but are hidden from agents."""
+        client, _ = self._make_app()
+        self._create(client, "pause-me")
+        assert "pause-me" in self._workspace_entry_names()
+
+        resp = client.post(
+            "/admin/code-locations/edit/pause-me",
+            data={"python_file": "main.py", "status": "paused"},
+            follow_redirects=False,
+        )
+        assert resp.status_code in (302, 303), resp.text[:500]
+
+        list_resp = client.get("/admin/code-locations/list")
+        assert "pause-me" in list_resp.text  # still listed in admin
+        assert "paused" in list_resp.text
+        assert "pause-me" not in self._workspace_entry_names()  # hidden from agents
+
+    def test_resumed_location_returns_to_workspace_entries(self):
+        client, _ = self._make_app()
+        self._create(client, "resume-me")
+        client.post(
+            "/admin/code-locations/edit/resume-me",
+            data={"python_file": "main.py", "status": "paused"},
+            follow_redirects=False,
+        )
+
+        resp = client.post(
+            "/admin/code-locations/edit/resume-me",
+            data={"python_file": "main.py", "status": "active"},
+            follow_redirects=False,
+        )
+        assert resp.status_code in (302, 303), resp.text[:500]
+        assert "resume-me" in self._workspace_entry_names()
+
+    def test_invalid_status_rejected(self):
+        """The legacy 'removed' status (and any other value) is no longer valid."""
+        client, _ = self._make_app()
+        self._create(client, "bad-status")
+
+        resp = client.post(
+            "/admin/code-locations/edit/bad-status",
+            data={"python_file": "main.py", "status": "removed"},
+            follow_redirects=True,
+        )
+        assert "Invalid status" in resp.text

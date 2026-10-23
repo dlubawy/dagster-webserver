@@ -1,0 +1,402 @@
+/* Admin portal stylesheet.
+ *
+ * Design tokens are shared with the login page (dagster_webserver/auth/routes.py)
+ * and mirror the Dagster webapp ui-components theme, so the admin portal reads
+ * as part of the main UI rather than a separate product.
+ */
+
+/* ── Theme tokens (light / dark) ──────────────────────── */
+:root, .themeLight {
+  --bg: #ffffff;
+  --bg-card: #ffffff;
+  --bg-input: #f5f6f8;
+  --bg-input-hover: #ebecef;
+  --bg-input-focus: #ffffff;
+  --text-default: #171c2c;
+  --text-light: #3f485b;
+  --text-lighter: #6f7a91;
+  --border-default: #d2d6de;
+  --border-subtle: #ebecef;
+  --border-focus: #4f438d;
+  --accent-primary: #4f438d;
+  --accent-primary-hover: #4037b5;
+  --link: #4f438d;
+  --link-hover: #4037b5;
+  --accent-reversed: #ffffff;
+  --error-bg: #fef0ed;
+  --error-text: #c72a1c;
+  --error-border: #f5c2b8;
+  --success-bg: #e6f4ea;
+  --success-text: #1e7e34;
+  --success-border: #b7e1c3;
+  --shadow-card: 0 1px 3px rgba(3, 6, 21, .08), 0 4px 12px rgba(3, 6, 21, .04);
+}
+
+/* Dark tokens — applied when the webapp theme setting is explicitly "Dark"
+ * (the theme-sync script in base.html adds .themeDark to <html>). */
+.themeDark {
+  --bg: #030615;
+  --bg-card: #171c2c;
+  --bg-input: #1d2237;
+  --bg-input-hover: #232844;
+  --bg-input-focus: #171c2c;
+  --text-default: #ffffff;
+  --text-light: #9ea7b9;
+  --text-lighter: #6f7a91;
+  --border-default: #2b3244;
+  --border-subtle: #1d2237;
+  --border-focus: #7269e4;
+  --accent-primary: #4f438d;
+  --accent-primary-hover: #7269e4;
+  --link: #b9b4f1; /* webapp themeDark --color-link-default (core blue200) */
+  --link-hover: #7269e4;
+  --accent-reversed: #ffffff;
+  --error-bg: #2d1519;
+  --error-text: #e5a0a0;
+  --error-border: #5c2a30;
+  --success-bg: #0f2b1a;
+  --success-text: #7fc894;
+  --success-border: #1e462c;
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, .2), 0 4px 12px rgba(0, 0, 0, .12);
+}
+
+/* No explicit theme setting — fall back to the OS preference. */
+@media (prefers-color-scheme: dark) {
+  :root:not(.themeLight):not(.themeDark) {
+    --bg: #030615;
+    --bg-card: #171c2c;
+    --bg-input: #1d2237;
+    --bg-input-hover: #232844;
+    --bg-input-focus: #171c2c;
+    --text-default: #ffffff;
+    --text-light: #9ea7b9;
+    --text-lighter: #6f7a91;
+    --border-default: #2b3244;
+    --border-subtle: #1d2237;
+    --border-focus: #7269e4;
+    --accent-primary: #4f438d;
+    --accent-primary-hover: #7269e4;
+    --link: #b9b4f1;
+    --link-hover: #7269e4;
+    --accent-reversed: #ffffff;
+    --error-bg: #2d1519;
+    --error-text: #e5a0a0;
+    --error-border: #5c2a30;
+    --success-bg: #0f2b1a;
+    --success-text: #7fc894;
+    --success-border: #1e462c;
+    --shadow-card: 0 1px 3px rgba(0, 0, 0, .2), 0 4px 12px rgba(0, 0, 0, .12);
+  }
+}
+
+/* ── Reset & base ─────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+               'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: var(--bg);
+  color: var(--text-default);
+  min-height: 100vh;
+  display: flex;
+  font-size: 14px;
+}
+
+a { color: var(--accent-primary); }
+
+/* ── Sidebar (light, matching the main app nav) ───────── */
+.sidebar {
+  width: 232px;
+  background: var(--bg-card);
+  border-right: 1px solid var(--border-default);
+  padding: 16px 12px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 12px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-default);
+}
+
+.sidebar nav { display: flex; flex-direction: column; gap: 2px; }
+
+.sidebar nav a {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  color: var(--text-light);
+  text-decoration: none;
+  font-size: 14px;
+}
+
+.sidebar nav a svg { color: var(--text-lighter); flex-shrink: 0; }
+
+.sidebar nav a:hover {
+  background: var(--bg-input);
+  color: var(--text-default);
+}
+
+.sidebar nav a.active {
+  background: var(--bg-input-hover);
+  color: var(--text-default);
+  font-weight: 500;
+}
+
+.sidebar nav a.active svg { color: var(--accent-primary); }
+
+/* ── Main column ──────────────────────────────────────── */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.header {
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border-default);
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.header a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--link);
+  text-decoration: none;
+  font-size: 14px;
+}
+
+.header a:hover { color: var(--link-hover); text-decoration: underline; }
+
+.header .user {
+  font-size: 13px;
+  color: var(--text-lighter);
+}
+
+.content {
+  padding: 24px;
+  flex: 1;
+}
+
+h1.page-title {
+  font-size: 20px;
+  font-weight: 600;
+  margin-bottom: 16px;
+}
+
+/* ── Flash messages ───────────────────────────────────── */
+.flash {
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  margin-bottom: 16px;
+}
+
+.flash.success { background: var(--success-bg); color: var(--success-text); border: 1px solid var(--success-border); }
+.flash.error { background: var(--error-bg); color: var(--error-text); border: 1px solid var(--error-border); }
+
+/* ── Buttons ──────────────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1.4;
+}
+
+.btn-primary { background: var(--accent-primary); color: var(--accent-reversed); }
+.btn-primary:hover { background: var(--accent-primary-hover); }
+.btn-secondary { background: var(--bg-input); color: var(--text-default); border-color: var(--border-default); }
+.btn-secondary:hover { background: var(--bg-input-hover); }
+.btn-danger { background: var(--error-text); color: #fff; }
+.btn-danger:hover { opacity: .9; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+
+/* ── Tables ───────────────────────────────────────────── */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-card);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+th, td {
+  padding: 10px 14px;
+  text-align: left;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 13px;
+}
+
+th {
+  background: var(--bg-input);
+  font-weight: 600;
+  color: var(--text-light);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .02em;
+}
+
+tr:last-child td { border-bottom: none; }
+
+td a.row-link { color: var(--accent-primary); text-decoration: none; }
+td a.row-link:hover { text-decoration: underline; }
+
+/* ── Forms ────────────────────────────────────────────── */
+.form-group { margin-bottom: 16px; }
+
+.form-group label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-light);
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: .02em;
+}
+
+.form-group input[type="text"],
+.form-group input[type="password"],
+.form-group input[type="email"],
+.form-group select,
+.form-group textarea {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  font-size: 14px;
+  font-family: inherit;
+  background: var(--bg-card);
+  color: var(--text-default);
+}
+
+.form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+  outline: none;
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--border-focus) 25%, transparent);
+}
+
+.form-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  font-size: 13px;
+}
+
+/* ── Badges ───────────────────────────────────────────── */
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.badge-true { background: var(--success-bg); color: var(--success-text); }
+.badge-false { background: var(--error-bg); color: var(--error-text); }
+.badge-builtin { background: var(--bg-input); color: var(--text-light); }
+
+/* ── Actions bar ──────────────────────────────────────── */
+.actions-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.search-input {
+  padding: 6px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  font-size: 13px;
+  width: 250px;
+  background: var(--bg-card);
+  color: var(--text-default);
+}
+
+/* ── Detail view ──────────────────────────────────────── */
+.detail-grid {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 8px 16px;
+  background: var(--bg-card);
+  padding: 20px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+}
+
+.detail-grid dt {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-light);
+  text-transform: uppercase;
+  letter-spacing: .02em;
+}
+
+.detail-grid dd { font-size: 14px; }
+
+/* ── Permissions grid ─────────────────────────────────── */
+.permissions-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 4px 16px;
+  max-height: 500px;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+/* ── Dashboard cards ──────────────────────────────────── */
+.dash-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 16px;
+}
+
+.dash-card {
+  display: block;
+  background: var(--bg-card);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  padding: 20px;
+  text-decoration: none;
+  color: var(--text-default);
+  transition: border-color .15s, box-shadow .15s;
+}
+
+.dash-card:hover {
+  border-color: var(--border-focus);
+  box-shadow: var(--shadow-card);
+}
+
+.dash-card .dash-icon {
+  color: var(--accent-primary);
+  margin-bottom: 8px;
+}
+
+.dash-card .dash-label { font-size: 15px; font-weight: 500; }

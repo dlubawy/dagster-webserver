@@ -36,6 +36,11 @@ class AdminPermission(str, Enum):
     ADMIN_VIEW_OIDC = "admin_view_oidc"
     ADMIN_EDIT_OIDC = "admin_edit_oidc"  # implies ADMIN_VIEW_OIDC
 
+    ADMIN_VIEW_CODE_LOCATIONS = "admin_view_code_locations"
+    ADMIN_EDIT_CODE_LOCATIONS = (
+        "admin_edit_code_locations"  # implies ADMIN_VIEW_CODE_LOCATIONS
+    )
+
 
 # ---------------------------------------------------------------------------
 # Internal helper
@@ -99,6 +104,23 @@ def can_view_oidc(perms: dict[str, PermissionResult]) -> bool:
 def can_edit_oidc(perms: dict[str, PermissionResult]) -> bool:
     """Can the user create / edit / delete OIDC providers?"""
     return _has(perms, AdminPermission.ADMIN_EDIT_OIDC.value)
+
+
+# ---------------------------------------------------------------------------
+# Code Location permissions
+# ---------------------------------------------------------------------------
+
+
+def can_view_code_locations(perms: dict[str, PermissionResult]) -> bool:
+    """Can the user view code locations?  EDIT implies VIEW."""
+    return _has(perms, AdminPermission.ADMIN_EDIT_CODE_LOCATIONS.value) or _has(
+        perms, AdminPermission.ADMIN_VIEW_CODE_LOCATIONS.value
+    )
+
+
+def can_edit_code_locations(perms: dict[str, PermissionResult]) -> bool:
+    """Can the user create / edit / delete code locations?"""
+    return _has(perms, AdminPermission.ADMIN_EDIT_CODE_LOCATIONS.value)
 
 
 # ---------------------------------------------------------------------------

@@ -2,13 +2,13 @@
 {% block title %}{{ view.label }}: {{ pk }} — Dagster Admin{% endblock %}
 {% block content %}
 <div class="actions-bar">
-  <h2 style="flex: 1;">{{ view.label }}: {{ pk }}</h2>
+  <h2 class="page-title" style="flex: 1; margin-bottom: 0;">{{ view.label }}: {{ pk }}</h2>
   <a href="/admin/{{ view.identity }}/list" class="btn btn-secondary">
-    <i class="fas fa-arrow-left"></i> Back to list
+    {{ icon("arrow-left", 14) }} Back to list
   </a>
   {% if view.can_edit(request) %}
   <a href="/admin/{{ view.identity }}/edit/{{ pk }}" class="btn btn-primary">
-    <i class="fas fa-edit"></i> Edit
+    {{ icon("edit", 14) }} Edit
   </a>
   {% endif %}
 </div>
@@ -19,14 +19,48 @@
   <dd>
     {% if field in ('is_active', 'is_builtin') %}
       <span class="badge badge-{{ obj[field] | lower }}">{{ obj[field] | lower | replace('true', 'Yes') | replace('false', 'No') }}</span>
-    {% elif field == 'permissions' %}
-      <pre style="font-size: 11px; background: #f5f6f8; padding: 8px; border-radius: 4px; max-height: 200px; overflow: auto;">{{ obj[field] | tojson(indent=2) }}</pre>
+    {% elif field == 'permissions' or field == 'deploy_metadata' %}
+      <pre style="font-size: 11px; background: var(--bg-input); padding: 8px; border-radius: 4px; max-height: 200px; overflow: auto;">{{ obj[field] }}</pre>
+    {% elif field == 'status' %}
+      <span class="badge badge-{{ 'true' if obj[field] == 'active' else 'false' }}">{{ obj[field] }}</span>
     {% else %}
       {{ obj[field] or '(empty)' }}
     {% endif %}
   </dd>
   {% endfor %}
 </dl>
+
+{# Role assignments (read-only) for users and service accounts #}
+{% if view.identity in ('users', 'service-accounts') and role_assignments is defined %}
+<div style="margin-top: 24px;">
+  <h3 style="font-size: 14px; color: var(--text-light); margin-bottom: 12px;">
+    {{ icon("shield-alt", 14) }} Role Assignments
+  </h3>
+  {% if role_assignments %}
+  <table style="max-width: 500px;">
+    <thead>
+      <tr><th>Role</th><th>Scope</th></tr>
+    </thead>
+    <tbody>
+      {% for ra in role_assignments %}
+      <tr>
+        <td style="text-transform: capitalize;">{{ ra.role_name | replace('_', ' ') }}</td>
+        <td>
+          {% if ra.code_location_name %}
+          <code style="font-size: 12px;">{{ ra.code_location_name }}</code>
+          {% else %}
+          <span class="badge badge-true">Global</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="font-size: 12px; color: var(--text-lighter);">No role assignments.</p>
+  {% endif %}
+</div>
+{% endif %}
 
 {% if row_actions %}
 <div style="margin-top: 16px;">
@@ -38,7 +72,7 @@
     <input type="hidden" name="action_name" value="{{ ra.name }}"/>
     <input type="hidden" name="pk" value="{{ pk }}"/>
     <button type="submit" class="btn btn-sm btn-secondary">
-      <i class="{{ ra.icon_class }}"></i> {{ ra.text }}
+      {{ icon(ra.icon_class, 14) }} {{ ra.text }}
     </button>
   </form>
   {% endif %}

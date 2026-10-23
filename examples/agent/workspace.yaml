@@ -1,0 +1,23 @@
+# Example workspace.yaml — defines code locations for the agent to manage.
+# Place this in your DAGSTER_HOME directory alongside dagster.yaml.
+#
+# On webserver startup, these entries are upserted into the database.
+# Locations can also be created/modified via the REST API or admin portal;
+# workspace.yaml provides a static, version-controllable alternative.
+
+locations:
+  - name: my-first-location
+    python_file: /path/to/definitions.py
+    working_directory: /path/to/project
+    labels:
+      team: data-platform
+      env: development
+
+  - name: etl-pipelines
+    module_name: my_etl_package
+    working_directory: /opt/etl
+    executable_path: /usr/local/bin/python3
+    attribute: repository
+    labels:
+      team: data-platform
+      env: production

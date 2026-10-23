@@ -7,12 +7,14 @@ database infrastructure cleanly separated from auth logic.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select, text
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import selectinload
 
 from dagster_webserver.auth.users import (
     AuthUser,
@@ -21,9 +23,11 @@ from dagster_webserver.auth.users import (
     _verify_password,
 )
 from dagster_webserver.database import (
+    ApiKey,
     OIDCProvider,
     Role,
     User,
+    UserRoleAssignment,
     get_engine,
     get_session_factory,
     init_engine,
@@ -31,6 +35,11 @@ from dagster_webserver.database import (
 from dagster_webserver.database.models import Base
 
 logger = logging.getLogger("dagster-webserver.auth")
+
+# Reusable eager-load option: loads role_assignments and their roles in one query.
+_USER_ROLE_ASSIGNMENTS_LOAD = selectinload(User.role_assignments).selectinload(
+    UserRoleAssignment.role
+)
 
 
 class DatabaseUserBackend(UserBackend):
@@ -118,7 +127,7 @@ class DatabaseUserBackend(UserBackend):
         async with get_session_factory()() as session:
             result = await session.execute(
                 select(User)
-                .options(joinedload(User.role))
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
                 .where(User.username == username)
             )
             user = result.scalar_one_or_none()
@@ -138,7 +147,7 @@ class DatabaseUserBackend(UserBackend):
         async with get_session_factory()() as session:
             result = await session.execute(
                 select(User)
-                .options(joinedload(User.role))
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
                 .where(User.username == username)
             )
             user = result.scalar_one_or_none()
@@ -157,11 +166,10 @@ class DatabaseUserBackend(UserBackend):
         email: str | None = None,
         display_name: str | None = None,
     ) -> AuthUser:
-        """Create a new user.
+        """Create a new user with a global role assignment.
 
         ``role`` is a role name string (e.g. ``"viewer"``, ``"admin"``, or a
-        custom role name).  Pass ``None`` to leave ``role_id`` unset — the
-        default role will be used at resolution time.
+        custom role name). Defaults to ``"viewer"`` if not specified.
 
         Raises
         ------
@@ -177,7 +185,6 @@ class DatabaseUserBackend(UserBackend):
         user = User(
             username=username,
             password_hash=_hash_password(password),
-            role_id=role_obj.id if role_obj else None,
             email=email,
             display_name=display_name,
             is_active=True,
@@ -185,13 +192,25 @@ class DatabaseUserBackend(UserBackend):
 
         async with get_session_factory()() as session:
             session.add(user)
-            await session.commit()
-            await session.refresh(user)
-            if user.role_id is not None:
-                result = await session.execute(
-                    select(Role).where(Role.id == user.role_id)
+            await session.flush()  # Get user.id
+            # Create global role assignment if a specific role was provided.
+            # If role is None, no global assignment is created — the default
+            # role will be used at resolution time in _to_auth_user.
+            if role_obj:
+                assignment = UserRoleAssignment(
+                    user_id=user.id,
+                    role_id=role_obj.id,
+                    code_location_name=None,  # Global scope
                 )
-                user.role = result.scalar_one_or_none()
+                session.add(assignment)
+            await session.commit()
+            # Re-fetch with eager loading
+            result = await session.execute(
+                select(User)
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
+                .where(User.id == user.id)
+            )
+            user = result.scalar_one()
             return self._to_auth_user(user)
 
     async def update_user(
@@ -204,13 +223,16 @@ class DatabaseUserBackend(UserBackend):
         display_name: str | None = None,
         is_active: bool | None = None,
     ) -> AuthUser:
-        """Update one or more fields.  Returns updated ``AuthUser``."""
+        """Update one or more fields.  Returns updated ``AuthUser``.
+
+        If ``role`` is provided, updates the user's global role assignment.
+        """
         await self._ensure_ready()
 
         async with get_session_factory()() as session:
             result = await session.execute(
                 select(User)
-                .options(joinedload(User.role))
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
                 .where(User.username == username)
             )
             user = result.scalar_one_or_none()
@@ -227,8 +249,23 @@ class DatabaseUserBackend(UserBackend):
 
             if role is not None:
                 role_obj = await self._lookup_role(role, session=session)
-                user.role_id = role_obj.id
-                await session.refresh(user, ["role"])
+                # Update or create the global role assignment
+                global_assignment = next(
+                    (a for a in user.role_assignments if a.code_location_name is None),
+                    None,
+                )
+                if global_assignment:
+                    global_assignment.role_id = role_obj.id
+                    global_assignment.role = role_obj  # Keep in-memory state consistent
+                else:
+                    new_assign = UserRoleAssignment(
+                        user_id=user.id,
+                        role_id=role_obj.id,
+                        code_location_name=None,
+                    )
+                    new_assign.role = role_obj
+                    session.add(new_assign)
+                    user.role_assignments.append(new_assign)
 
             if email is not None:
                 user.email = email
@@ -238,10 +275,6 @@ class DatabaseUserBackend(UserBackend):
                 user.is_active = is_active
 
             await session.commit()
-            await session.refresh(user)
-            if user.role_id is not None:
-                r = await session.execute(select(Role).where(Role.id == user.role_id))
-                user.role = r.scalar_one_or_none()
             return self._to_auth_user(user)
 
     async def delete_user(self, username: str) -> None:
@@ -265,12 +298,386 @@ class DatabaseUserBackend(UserBackend):
         async with get_session_factory()() as session:
             result = await session.execute(
                 select(User)
-                .options(joinedload(User.role))
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
                 .where(User.is_active.is_(True))
                 .order_by(User.username)
             )
             users = result.scalars().all()
             return [self._to_auth_user(u) for u in users]
+
+    # ── API Key Authentication ───────────────────────────────────
+
+    async def get_user_by_api_key(self, api_key: str) -> AuthUser | None:
+        """Look up a user by their API key (SHA-256 hashed lookup)."""
+        await self._ensure_ready()
+
+        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(ApiKey).where(
+                    ApiKey.key_hash == key_hash,
+                    ApiKey.is_active.is_(True),
+                )
+            )
+            api_key_obj = result.scalar_one_or_none()
+
+            if not api_key_obj:
+                return None
+
+            # Check expiration
+            if api_key_obj.expires_at and api_key_obj.expires_at < datetime.now(
+                timezone.utc
+            ):
+                return None
+
+            # Load the user with role assignments
+            result = await session.execute(
+                select(User)
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
+                .where(User.id == api_key_obj.user_id)
+            )
+            user = result.scalar_one_or_none()
+
+            if not user or not user.is_active:
+                return None
+
+            # Update last_used_at
+            api_key_obj.last_used_at = datetime.now(timezone.utc)
+            await session.commit()
+
+            return self._to_auth_user(user)
+
+    async def create_api_key(
+        self,
+        username: str,
+        name: str,
+        expires_in_days: int | None = None,
+    ) -> tuple[ApiKey, str]:
+        """Create a new API key for a user.
+
+        Returns the ORM object and the plaintext key (shown once).
+        """
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(User).where(User.username == username)
+            )
+            user = result.scalar_one_or_none()
+            if user is None:
+                raise ValueError(f"User '{username}' not found")
+
+            import secrets
+
+            plaintext_key = secrets.token_urlsafe(32)
+            key_hash = hashlib.sha256(plaintext_key.encode()).hexdigest()
+
+            expires_at = None
+            if expires_in_days:
+                expires_at = datetime.now(timezone.utc) + timedelta(
+                    days=expires_in_days
+                )
+
+            api_key_obj = ApiKey(
+                user_id=user.id,
+                key_hash=key_hash,
+                name=name,
+                is_active=True,
+                expires_at=expires_at,
+            )
+            session.add(api_key_obj)
+            await session.commit()
+            await session.refresh(api_key_obj)
+
+            return api_key_obj, plaintext_key
+
+    async def list_api_keys(self, username: str) -> list[ApiKey]:
+        """List all API keys for a user."""
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(User).where(User.username == username)
+            )
+            user = result.scalar_one_or_none()
+            if user is None:
+                raise ValueError(f"User '{username}' not found")
+
+            result = await session.execute(
+                select(ApiKey)
+                .where(ApiKey.user_id == user.id)
+                .order_by(ApiKey.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def revoke_api_key(self, key_id: int) -> bool:
+        """Deactivate an API key."""
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(select(ApiKey).where(ApiKey.id == key_id))
+            api_key_obj = result.scalar_one_or_none()
+            if api_key_obj is None:
+                return False
+            api_key_obj.is_active = False
+            await session.commit()
+            return True
+
+    # ── Service Account Management ───────────────────────────────
+
+    async def create_service_account(
+        self,
+        username: str,
+        role_name: str = "viewer",
+        display_name: str | None = None,
+    ) -> AuthUser:
+        """Create a service account user.
+
+        Service accounts have ``is_service_account=True`` and empty
+        ``password_hash`` — they can only authenticate via API key.
+        A global role assignment is created in ``user_role_assignments``.
+        """
+        await self._ensure_ready()
+
+        role_obj = await self._lookup_role(role_name)
+
+        user = User(
+            username=username,
+            password_hash="",  # No password for service accounts
+            display_name=display_name or username,
+            is_active=True,
+            is_service_account=True,
+        )
+
+        async with get_session_factory()() as session:
+            session.add(user)
+            await session.flush()  # Get user.id
+
+            # Create global role assignment
+            assignment = UserRoleAssignment(
+                user_id=user.id,
+                role_id=role_obj.id,
+                code_location_name=None,  # Global
+            )
+            session.add(assignment)
+            await session.commit()
+
+            # Re-fetch with eager loading
+            result = await session.execute(
+                select(User)
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
+                .where(User.id == user.id)
+            )
+            user = result.scalar_one()
+            return self._to_auth_user(user)
+
+    # ── Per-Location Role Assignments ────────────────────────────
+
+    async def assign_role_to_location(
+        self,
+        username: str,
+        role_name: str,
+        code_location_name: str | None = None,
+    ) -> UserRoleAssignment:
+        """Assign a role to a user, optionally scoped to a code location."""
+        await self._ensure_ready()
+
+        role_obj = await self._lookup_role(role_name)
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(User).where(User.username == username)
+            )
+            user = result.scalar_one_or_none()
+            if user is None:
+                raise ValueError(f"User '{username}' not found")
+
+            # Check if assignment already exists
+            result = await session.execute(
+                select(UserRoleAssignment).where(
+                    UserRoleAssignment.user_id == user.id,
+                    UserRoleAssignment.role_id == role_obj.id,
+                    UserRoleAssignment.code_location_name == code_location_name,
+                )
+            )
+            existing = result.scalar_one_or_none()
+            if existing:
+                return existing
+
+            assignment = UserRoleAssignment(
+                user_id=user.id,
+                role_id=role_obj.id,
+                code_location_name=code_location_name,
+            )
+            session.add(assignment)
+            await session.commit()
+            await session.refresh(assignment)
+            return assignment
+
+    async def remove_role_from_location(
+        self,
+        username: str,
+        role_name: str,
+        code_location_name: str | None = None,
+    ) -> bool:
+        """Remove a role assignment from a user."""
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(User).where(User.username == username)
+            )
+            user = result.scalar_one_or_none()
+            if user is None:
+                return False
+
+            result = await session.execute(select(Role).where(Role.name == role_name))
+            role_obj = result.scalar_one_or_none()
+            if role_obj is None:
+                return False
+
+            result = await session.execute(
+                select(UserRoleAssignment).where(
+                    UserRoleAssignment.user_id == user.id,
+                    UserRoleAssignment.role_id == role_obj.id,
+                    UserRoleAssignment.code_location_name == code_location_name,
+                )
+            )
+            assignment = result.scalar_one_or_none()
+            if assignment is None:
+                return False
+
+            await session.delete(assignment)
+            await session.commit()
+            return True
+
+    async def set_user_role_assignments(
+        self,
+        username: str,
+        assignments: list[dict[str, str | None]],
+    ) -> list[UserRoleAssignment]:
+        """Replace all role assignments for a user.
+
+        Args:
+            username: The user to update.
+            assignments: List of dicts with keys 'role_name' and 'code_location_name'
+                         (None for global). Scopes must be unique — one role per scope.
+
+        Raises:
+            ValueError: If user not found, role not found, or duplicate scopes.
+        """
+        await self._ensure_ready()
+
+        # Validate unique scopes
+        seen_scopes: set[str | None] = set()
+        for a in assignments:
+            scope = a.get("code_location_name") or None
+            if scope in seen_scopes:
+                display = scope if scope else "(global)"
+                raise ValueError(
+                    f"Duplicate scope '{display}' — only one role per scope is allowed"
+                )
+            seen_scopes.add(scope)
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(User).where(User.username == username)
+            )
+            user = result.scalar_one_or_none()
+            if user is None:
+                raise ValueError(f"User '{username}' not found")
+
+            # Delete all existing assignments
+            existing_result = await session.execute(
+                select(UserRoleAssignment).where(UserRoleAssignment.user_id == user.id)
+            )
+            for existing in existing_result.scalars().all():
+                await session.delete(existing)
+
+            # Insert new assignments
+            new_assignments: list[UserRoleAssignment] = []
+            for a in assignments:
+                role_name = a["role_name"]
+                scope = a.get("code_location_name") or None
+
+                role_result = await session.execute(
+                    select(Role).where(Role.name == role_name)
+                )
+                role_obj = role_result.scalar_one_or_none()
+                if role_obj is None:
+                    raise ValueError(f"Role '{role_name}' not found")
+
+                assignment = UserRoleAssignment(
+                    user_id=user.id,
+                    role_id=role_obj.id,
+                    code_location_name=scope,
+                )
+                session.add(assignment)
+                new_assignments.append(assignment)
+
+            await session.commit()
+            for a in new_assignments:
+                await session.refresh(a)
+            return new_assignments
+
+    async def get_user_roles_for_location(
+        self, username: str, location_name: str | None = None
+    ) -> list[Role]:
+        """Get all roles applicable to a user for a given location.
+
+        Returns roles where ``code_location_name IS NULL`` (global)
+        or matches the given location name.
+        """
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(User).where(User.username == username)
+            )
+            user = result.scalar_one_or_none()
+            if user is None:
+                return []
+
+            stmt = (
+                select(Role)
+                .join(UserRoleAssignment, UserRoleAssignment.role_id == Role.id)
+                .where(
+                    UserRoleAssignment.user_id == user.id,
+                    (
+                        (UserRoleAssignment.code_location_name.is_(None))
+                        | (UserRoleAssignment.code_location_name == location_name)
+                    )
+                    if location_name
+                    else UserRoleAssignment.code_location_name.is_(None),
+                )
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def get_user_role_assignments(
+        self, username: str
+    ) -> list[UserRoleAssignment]:
+        """Get all role assignments for a user (for admin UI)."""
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(User).where(User.username == username)
+            )
+            user = result.scalar_one_or_none()
+            if user is None:
+                return []
+
+            from sqlalchemy.orm import selectinload
+
+            result = await session.execute(
+                select(UserRoleAssignment)
+                .options(selectinload(UserRoleAssignment.role))
+                .where(UserRoleAssignment.user_id == user.id)
+                .order_by(UserRoleAssignment.code_location_name)
+            )
+            return list(result.scalars().all())
 
     # ── Role CRUD ────────────────────────────────────────────────
 
@@ -330,31 +737,34 @@ class DatabaseUserBackend(UserBackend):
         await self._ensure_ready()
 
         async with get_session_factory()() as session:
-            result = await session.execute(
-                select(Role).options(joinedload(Role.users)).where(Role.name == name)
-            )
-            role = result.unique().scalar_one_or_none()
+            result = await session.execute(select(Role).where(Role.name == name))
+            role = result.scalar_one_or_none()
             if role is None:
                 raise ValueError(f"Role '{name}' not found")
             if role.is_builtin:
                 raise ValueError(f"Built-in role '{name}' cannot be deleted")
-            # Null out role_id on any users still assigned to this role
-            for user in role.users:
-                user.role_id = None
+            # Check if any role assignments reference this role
+            from sqlalchemy import func as sa_func
+
+            count_result = await session.execute(
+                select(sa_func.count())
+                .select_from(UserRoleAssignment)
+                .where(UserRoleAssignment.role_id == role.id)
+            )
+            if count_result.scalar() > 0:
+                raise ValueError(
+                    f"Cannot delete role '{name}' — it is still assigned to users"
+                )
             await session.delete(role)
             await session.commit()
 
     async def list_roles(self) -> list[Role]:
         """Return all roles (built-in and custom)."""
-        from sqlalchemy.orm import selectinload
-
         await self._ensure_ready()
 
         async with get_session_factory()() as session:
             result = await session.execute(
-                select(Role)
-                .options(selectinload(Role.users))
-                .order_by(Role.is_builtin.desc(), Role.name)
+                select(Role).order_by(Role.is_builtin.desc(), Role.name)
             )
             return list(result.scalars().all())
 
@@ -368,13 +778,26 @@ class DatabaseUserBackend(UserBackend):
 
     # ── Internal helpers ─────────────────────────────────────────
 
+    @staticmethod
+    def _get_global_role_from_assignments(user: User) -> Role | None:
+        """Find the user's global role from their role assignments.
+
+        Returns the Role object for the assignment with code_location_name=None,
+        or None if no global assignment exists.
+        """
+        for a in user.role_assignments:
+            if a.code_location_name is None and a.role is not None:
+                return a.role
+        return None
+
     def _to_auth_user(self, user: User) -> AuthUser:
         """Convert an ORM ``User`` to an ``AuthUser``.
 
-        If ``user.role`` is ``None``, falls back to the configured default
-        role.
+        The user's global role is derived from their role assignments
+        (the one with code_location_name=None). If no global assignment
+        exists, falls back to the configured default role.
         """
-        role = user.role
+        role = self._get_global_role_from_assignments(user)
         if role is None:
             role = self._default_role
             if role is None:
@@ -391,6 +814,7 @@ class DatabaseUserBackend(UserBackend):
                     email=user.email,
                     display_name=user.display_name,
                     oidc_sub=user.oidc_sub,
+                    is_service_account=user.is_service_account,
                 )
 
         if role.is_builtin:
@@ -401,6 +825,7 @@ class DatabaseUserBackend(UserBackend):
                 email=user.email,
                 display_name=user.display_name,
                 oidc_sub=user.oidc_sub,
+                is_service_account=user.is_service_account,
             )
         else:
             raw = role.permissions
@@ -417,6 +842,7 @@ class DatabaseUserBackend(UserBackend):
                 email=user.email,
                 display_name=user.display_name,
                 oidc_sub=user.oidc_sub,
+                is_service_account=user.is_service_account,
             )
 
     async def _lookup_role(self, name: str, *, session: Any = None) -> Role:
@@ -608,7 +1034,7 @@ class DatabaseUserBackend(UserBackend):
         async with get_session_factory()() as session:
             result = await session.execute(
                 select(User)
-                .options(joinedload(User.role))
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
                 .where(
                     User.oidc_provider_id == provider_id,
                     User.oidc_sub == oidc_sub,
@@ -625,7 +1051,9 @@ class DatabaseUserBackend(UserBackend):
 
         async with get_session_factory()() as session:
             result = await session.execute(
-                select(User).options(joinedload(User.role)).where(User.email == email)
+                select(User)
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
+                .where(User.email == email)
             )
             user = result.scalar_one_or_none()
             if user and user.is_active:
@@ -656,7 +1084,6 @@ class DatabaseUserBackend(UserBackend):
         user = User(
             username=username,
             password_hash="",
-            role_id=role_obj.id,
             email=email,
             display_name=display_name,
             is_active=True,
@@ -666,13 +1093,23 @@ class DatabaseUserBackend(UserBackend):
 
         async with get_session_factory()() as session:
             session.add(user)
-            await session.commit()
-            await session.refresh(user)
-            if user.role_id is not None:
-                result = await session.execute(
-                    select(Role).where(Role.id == user.role_id)
+            await session.flush()
+            # Create global role assignment (default viewer)
+            session.add(
+                UserRoleAssignment(
+                    user_id=user.id,
+                    role_id=role_obj.id,
+                    code_location_name=None,
                 )
-                user.role = result.scalar_one_or_none()
+            )
+            await session.commit()
+
+            result = await session.execute(
+                select(User)
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
+                .where(User.id == user.id)
+            )
+            user = result.scalar_one()
             return self._to_auth_user(user)
 
     async def link_oidc_to_user(
@@ -687,7 +1124,7 @@ class DatabaseUserBackend(UserBackend):
         async with get_session_factory()() as session:
             result = await session.execute(
                 select(User)
-                .options(joinedload(User.role))
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
                 .where(User.username == username)
             )
             user = result.scalar_one_or_none()
@@ -696,8 +1133,146 @@ class DatabaseUserBackend(UserBackend):
             user.oidc_provider_id = provider_id
             user.oidc_sub = oidc_sub
             await session.commit()
-            await session.refresh(user)
-            if user.role_id is not None:
-                r = await session.execute(select(Role).where(Role.id == user.role_id))
-                user.role = r.scalar_one_or_none()
+
+            result = await session.execute(
+                select(User)
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
+                .where(User.id == user.id)
+            )
+            user = result.scalar_one()
             return self._to_auth_user(user)
+
+    # ── Service Account Listing ─────────────────────────────────
+
+    async def list_service_accounts(self) -> list[AuthUser]:
+        """Return all active service accounts."""
+        await self._ensure_ready()
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(User)
+                .options(_USER_ROLE_ASSIGNMENTS_LOAD)
+                .where(User.is_active.is_(True), User.is_service_account.is_(True))
+                .order_by(User.username)
+            )
+            users = result.scalars().all()
+            return [self._to_auth_user(u) for u in users]
+
+    # ── Code Location Management ────────────────────────────────
+
+    async def list_code_locations(self, status: str | None = None) -> list[Any]:
+        """List code location definitions."""
+        await self._ensure_ready()
+
+        from dagster_webserver.database.models import CodeLocationDefinition
+
+        async with get_session_factory()() as session:
+            stmt = select(CodeLocationDefinition).order_by(
+                CodeLocationDefinition.location_name
+            )
+            if status:
+                stmt = stmt.where(CodeLocationDefinition.status == status)
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def get_code_location(self, location_name: str) -> Any | None:
+        """Get a single code location by name."""
+        await self._ensure_ready()
+
+        from dagster_webserver.database.models import CodeLocationDefinition
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(CodeLocationDefinition).where(
+                    CodeLocationDefinition.location_name == location_name
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def create_code_location(
+        self,
+        location_name: str,
+        deploy_metadata: dict[str, Any],
+        labels: dict[str, str] | None = None,
+    ) -> Any:
+        """Create a new code location definition."""
+        await self._ensure_ready()
+
+        from dagster_webserver.database.models import CodeLocationDefinition
+
+        async with get_session_factory()() as session:
+            existing = await session.execute(
+                select(CodeLocationDefinition).where(
+                    CodeLocationDefinition.location_name == location_name
+                )
+            )
+            if existing.scalar_one_or_none():
+                raise ValueError(f"Code location '{location_name}' already exists")
+
+            loc = CodeLocationDefinition(
+                location_name=location_name,
+                deploy_metadata=deploy_metadata,
+                labels=labels,
+                status="active",
+            )
+            session.add(loc)
+            await session.commit()
+            await session.refresh(loc)
+            return loc
+
+    async def update_code_location(
+        self,
+        location_name: str,
+        deploy_metadata: dict[str, Any] | None = None,
+        labels: dict[str, str] | None = None,
+        status: str | None = None,
+    ) -> Any:
+        """Update an existing code location."""
+        await self._ensure_ready()
+
+        from dagster_webserver.database.models import CodeLocationDefinition
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(CodeLocationDefinition).where(
+                    CodeLocationDefinition.location_name == location_name
+                )
+            )
+            loc = result.scalar_one_or_none()
+            if loc is None:
+                raise ValueError(f"Code location '{location_name}' not found")
+
+            if deploy_metadata is not None:
+                loc.deploy_metadata = deploy_metadata
+            if labels is not None:
+                loc.labels = labels
+            if status is not None:
+                loc.status = status
+            await session.commit()
+            await session.refresh(loc)
+            return loc
+
+    async def delete_code_location(self, location_name: str) -> bool:
+        """Hard-delete a code location definition.
+
+        Agents reconcile against the workspace-entries API (which only
+        returns ``status == 'active'`` rows), so removing the row causes
+        them to tear down the location's server on their next sync. Use
+        the ``status`` column for lifecycle signalling (pause/resume).
+        """
+        await self._ensure_ready()
+
+        from dagster_webserver.database.models import CodeLocationDefinition
+
+        async with get_session_factory()() as session:
+            result = await session.execute(
+                select(CodeLocationDefinition).where(
+                    CodeLocationDefinition.location_name == location_name
+                )
+            )
+            loc = result.scalar_one_or_none()
+            if loc is None:
+                return False
+            await session.delete(loc)
+            await session.commit()
+            return True

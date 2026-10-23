@@ -5,6 +5,7 @@ and maps each role to the Dagster Permissions enum values.
 """
 
 from enum import Enum, unique
+from typing import Any
 
 from dagster._core.workspace.permissions import PermissionResult, Permissions
 
@@ -70,6 +71,9 @@ def _admin_permissions_for_role(role: Role) -> dict[str, PermissionResult]:
             AdminPermission.ADMIN_EDIT_OIDC.value: PermissionResult(
                 enabled=True, disabled_reason=None
             ),
+            AdminPermission.ADMIN_EDIT_CODE_LOCATIONS.value: PermissionResult(
+                enabled=True, disabled_reason=None
+            ),
         }
     return {
         AdminPermission.ADMIN_VIEW_USERS.value: PermissionResult(
@@ -95,6 +99,14 @@ def _admin_permissions_for_role(role: Role) -> dict[str, PermissionResult]:
         AdminPermission.ADMIN_EDIT_OIDC.value: PermissionResult(
             enabled=False,
             disabled_reason=f"Role {role.value} missing admin_edit_oidc permission",
+        ),
+        AdminPermission.ADMIN_VIEW_CODE_LOCATIONS.value: PermissionResult(
+            enabled=False,
+            disabled_reason=f"Role {role.value} missing admin_view_code_locations permission",
+        ),
+        AdminPermission.ADMIN_EDIT_CODE_LOCATIONS.value: PermissionResult(
+            enabled=False,
+            disabled_reason=f"Role {role.value} missing admin_edit_code_locations permission",
         ),
     }
 
@@ -135,3 +147,114 @@ def get_custom_permissions(perm_map: dict[str, bool]) -> dict[str, PermissionRes
         )
         for perm, enabled in perm_map.items()
     }
+
+
+def resolve_permissions_for_location(
+    roles: list[Any],
+    location_name: str | None = None,
+) -> dict[str, PermissionResult]:
+    """Merge permissions from multiple role assignments for a given location.
+
+    Args:
+        roles: List of Role ORM objects applicable to the user (already filtered
+            by location in the query layer — only include roles where
+            ``code_location_name IS NULL`` or matches *location_name*).
+        location_name: The target code location (for error messages).
+
+    Returns:
+        A merged PermissionResult map. When multiple roles grant the same
+        permission, OR logic applies (if any role enables it, it's enabled).
+
+    If no roles are applicable, returns an all-disabled map.
+    """
+    if not roles:
+        # No applicable roles — return all-disabled
+        all_perms: dict[str, PermissionResult] = {}
+        for perm in Permissions:
+            all_perms[perm.name] = PermissionResult(
+                enabled=False,
+                disabled_reason=f"No role assigned for location '{location_name}'",
+            )
+        return all_perms
+
+    # Start with all permissions disabled
+    merged: dict[str, bool] = {perm.name: False for perm in Permissions}
+
+    for role in roles:
+        if role.is_builtin:
+            # Use the built-in permission map
+            try:
+                role_enum = Role(role.name)
+                perm_map = ROLE_PERMISSIONS[role_enum]
+                for perm, enabled in perm_map.items():
+                    if enabled:
+                        merged[perm.name] = True
+            except ValueError:
+                continue
+        else:
+            # Custom role — use its permissions JSON
+            raw = role.permissions
+            if isinstance(raw, dict):
+                perms = raw
+            elif isinstance(raw, str):
+                import json as _json
+
+                try:
+                    perms = _json.loads(raw) if raw else {}
+                except _json.JSONDecodeError:
+                    continue
+            else:
+                continue
+            for perm_name, enabled in perms.items():
+                if enabled and perm_name in merged:
+                    merged[perm_name] = True
+
+    # Build PermissionResult map
+    result: dict[str, PermissionResult] = {}
+    for perm_name, enabled in merged.items():
+        result[perm_name] = PermissionResult(
+            enabled=enabled,
+            disabled_reason=None
+            if enabled
+            else f"No applicable role grants {perm_name} for location '{location_name}'",
+        )
+
+    # Add admin portal permissions (only if any applicable role is ADMIN)
+    has_admin = any(
+        (r.is_builtin and r.name == "admin")
+        or (not r.is_builtin and _role_has_perm(r, "ADMIN_EDIT_USERS"))
+        for r in roles
+    )
+    if has_admin:
+        result.update(_admin_permissions_for_role(Role.ADMIN))
+    else:
+        result.update(
+            {
+                AdminPermission.ADMIN_VIEW_USERS.value: PermissionResult(
+                    enabled=False,
+                    disabled_reason="No admin role for this location",
+                ),
+                AdminPermission.ADMIN_EDIT_USERS.value: PermissionResult(
+                    enabled=False,
+                    disabled_reason="No admin role for this location",
+                ),
+            }
+        )
+
+    return result
+
+
+def _role_has_perm(role: Any, perm_name: str) -> bool:
+    """Check if a custom role's permissions dict includes a given permission."""
+    raw = role.permissions
+    if isinstance(raw, dict):
+        return bool(raw.get(perm_name, False))
+    elif isinstance(raw, str):
+        import json as _json
+
+        try:
+            perms = _json.loads(raw) if raw else {}
+            return bool(perms.get(perm_name, False))
+        except _json.JSONDecodeError:
+            return False
+    return False

@@ -2,10 +2,10 @@
 {% block title %}{{ view.plural_label }} — Dagster Admin{% endblock %}
 {% block content %}
 <div class="actions-bar">
-  <h2 style="flex: 1;">{{ view.plural_label }}</h2>
+  <h2 class="page-title" style="flex: 1; margin-bottom: 0;">{{ view.plural_label }}</h2>
   {% if view.can_create(request) %}
   <a href="/admin/{{ view.identity }}/create" class="btn btn-primary">
-    <i class="fas fa-plus"></i> Create {{ view.label }}
+    {{ icon("plus", 14) }} Create {{ view.label }}
   </a>
   {% endif %}
 </div>
@@ -13,7 +13,7 @@
 {% if actions %}
 <form method="post" action="/admin/{{ view.identity }}/action" id="batch-form">
   <div style="margin-bottom: 12px; display: flex; gap: 8px; align-items: center;">
-    <select name="action_name" id="batch-action" style="padding: 6px 10px; border: 1px solid #d2d6de; border-radius: 6px; font-size: 13px;">
+    <select name="action_name" id="batch-action" style="padding: 6px 10px; border: 1px solid var(--border-default); border-radius: 6px; font-size: 13px;">
       <option value="">Batch action…</option>
       {% for a in actions %}
       <option value="{{ a.name }}">{{ a.text }}</option>
@@ -39,7 +39,7 @@
     <tr>
       {% if actions %}
       <td>
-        <input type="checkbox" class="row-check" value="{{ item.username if view.identity == 'users' else item.name }}"/>
+        <input type="checkbox" class="row-check" value="{{ _get_pk(item, view.identity) }}"/>
       </td>
       {% endif %}
       {% for col in view.list_columns %}
@@ -61,9 +61,9 @@
         <form method="post" action="/admin/{{ view.identity }}/row-action" style="display: inline;"
               {% if ra.confirmation %}onsubmit="return confirm('{{ ra.confirmation }}')"{% endif %}>
           <input type="hidden" name="action_name" value="{{ ra.name }}"/>
-          <input type="hidden" name="pk" value="{{ item.username if view.identity == 'users' else item.name }}"/>
+          <input type="hidden" name="pk" value="{{ _get_pk(item, view.identity) }}"/>
           <button type="submit" class="btn btn-sm btn-secondary" title="{{ ra.text }}">
-            <i class="{{ ra.icon_class }}"></i>
+            {{ icon(ra.icon_class, 14) }}
           </button>
         </form>
         {% endif %}
@@ -74,7 +74,7 @@
     </tr>
     {% endfor %}
     {% if not items %}
-    <tr><td colspan="{{ view.list_columns | length + 2 }}" style="text-align: center; color: #6f7a91; padding: 24px;">No items found.</td></tr>
+    <tr><td colspan="{{ view.list_columns | length + 2 }}" style="text-align: center; color: var(--text-lighter); padding: 24px;">No items found.</td></tr>
     {% endif %}
   </tbody>
 </table>

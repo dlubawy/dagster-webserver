@@ -375,6 +375,11 @@ class DagsterWebserver(
         routes = (
             self._build_auth_routes()
             + [
+                # Admin portal stylesheet (shared design tokens with the login page)
+                Route(
+                    "/static/admin.css",
+                    lambda _: FileResponse(path=self.relative_path("static/admin.css")),
+                ),
                 Route("/server_info", self.webserver_info_endpoint),
                 Route("/dagit_info", self.webserver_info_endpoint),
                 Route(
@@ -423,6 +428,16 @@ class DagsterWebserver(
                     self.report_asset_observation_endpoint,
                     methods=["POST"],
                 ),
+            ]
+        )
+
+        # Mount agent API routes
+        from dagster_webserver.api.agent import build_agent_routes
+
+        routes.extend(build_agent_routes())
+
+        routes.extend(
+            [
                 Route("/{path:path}", self.index_html_endpoint),
                 Route("/", self.index_html_endpoint),
             ]

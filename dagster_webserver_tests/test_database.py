@@ -34,17 +34,14 @@ class TestDatabaseModels:
         assert "id" in user_table.columns
         assert "username" in user_table.columns
         assert "password_hash" in user_table.columns
-        assert "role_id" in user_table.columns
         assert "email" in user_table.columns
         assert "display_name" in user_table.columns
         assert "is_active" in user_table.columns
+        assert "is_service_account" in user_table.columns
         assert "created_at" in user_table.columns
         assert "updated_at" in user_table.columns
-
-    def test_user_role_id_is_nullable(self):
-        user_table = Base.metadata.tables["users"]
-        role_id_col = user_table.columns["role_id"]
-        assert role_id_col.nullable is True
+        # role_id has been removed — roles are managed via user_role_assignments
+        assert "role_id" not in user_table.columns
 
     def test_role_name_is_unique(self):
         role_table = Base.metadata.tables["roles"]

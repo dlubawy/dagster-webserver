@@ -1,0 +1,137 @@
+{# Shared partial: JS-managed role assignments widget.
+   Expects: roles (list[str]), location_names (list[str]),
+           initial_assignments (list[dict] with keys: role_name, code_location_name) #}
+<div class="role-assignments-widget" id="role-assignments-widget">
+  <input type="hidden" name="role_assignments" id="role-assignments-input" value=""/>
+
+  <table style="margin-bottom: 12px;" id="ra-table">
+    <thead>
+      <tr>
+        <th>Role</th>
+        <th>Scope</th>
+        <th style="width: 40px;"></th>
+      </tr>
+    </thead>
+    <tbody id="ra-tbody">
+      {% for a in initial_assignments %}
+      <tr data-role="{{ a.role_name }}" data-scope="{{ a.code_location_name or '' }}">
+        <td><span style="text-transform: capitalize;">{{ a.role_name | replace('_', ' ') }}</span></td>
+        <td>
+          {% if a.code_location_name %}
+          <code style="font-size: 12px;">{{ a.code_location_name }}</code>
+          {% else %}
+          <span class="badge badge-true">Global</span>
+          {% endif %}
+        </td>
+        <td><button type="button" class="btn btn-sm btn-danger ra-remove">{{ icon("times", 14) }}</button></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div style="display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap;">
+    <div class="form-group" style="margin-bottom: 0; min-width: 140px;">
+      <label for="ra-new-role" style="font-size: 12px;">Role</label>
+      <select id="ra-new-role" style="width: auto;">
+        <option value="">Select…</option>
+        {% for role in roles %}
+        <option value="{{ role }}">{{ role | replace('_', ' ') | title }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-group" style="margin-bottom: 0; min-width: 180px;">
+      <label for="ra-new-scope" style="font-size: 12px;">Scope (empty = global)</label>
+      <select id="ra-new-scope" style="width: auto;">
+        <option value="">— Global —</option>
+        {% for loc in location_names %}
+        <option value="{{ loc }}">{{ loc }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="button" class="btn btn-secondary" id="ra-add-btn" style="margin-bottom: 0;">
+      {{ icon("plus", 14) }} Add
+    </button>
+  </div>
+
+  <p style="font-size: 11px; color: var(--text-lighter); margin-top: 8px;">
+    One role per scope. The global scope determines general site access; location scopes gate specific code locations.
+  </p>
+</div>
+
+<script>
+(function() {
+  const tbody = document.getElementById('ra-tbody');
+  const addBtn = document.getElementById('ra-add-btn');
+  const hiddenInput = document.getElementById('role-assignments-input');
+  const roleSelect = document.getElementById('ra-new-role');
+  const scopeSelect = document.getElementById('ra-new-scope');
+
+  function getRows() {
+    return [...tbody.querySelectorAll('tr')].map(tr => ({
+      role_name: tr.dataset.role,
+      code_location_name: tr.dataset.scope || null
+    }));
+  }
+
+  function serialize() {
+    hiddenInput.value = JSON.stringify(getRows());
+  }
+
+  function scopeLabel(scope) {
+    return scope ? `<code style="font-size:12px;">${scope}</code>` : '<span class="badge badge-true">Global</span>';
+  }
+
+  function roleLabel(role) {
+    return role.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  }
+
+  // Remove button handler (event delegation)
+  tbody.addEventListener('click', (e) => {
+    const btn = e.target.closest('.ra-remove');
+    if (btn) {
+      btn.closest('tr').remove();
+      serialize();
+    }
+  });
+
+  // Add button handler
+  addBtn.addEventListener('click', () => {
+    const role = roleSelect.value;
+    const scope = scopeSelect.value || null;
+    if (!role) { alert('Please select a role'); return; }
+
+    // Check for duplicate scope
+    const existing = [...tbody.querySelectorAll('tr')];
+    const dup = existing.find(tr => (tr.dataset.scope || null) === scope);
+    if (dup) {
+      const scopeName = scope || 'Global';
+      alert(`A role is already assigned to scope "${scopeName}". Remove it first.`);
+      return;
+    }
+
+    const tr = document.createElement('tr');
+    tr.dataset.role = role;
+    tr.dataset.scope = scope || '';
+    tr.innerHTML = `
+      <td><span style="text-transform: capitalize;">${roleLabel(role)}</span></td>
+      <td>${scopeLabel(scope)}</td>
+      <td><button type="button" class="btn btn-sm btn-danger ra-remove">{{ icon("times", 14) }}</button></td>
+    `;
+    tbody.appendChild(tr);
+
+    // Reset selects
+    roleSelect.value = '';
+    scopeSelect.value = '';
+    serialize();
+  });
+
+  // Serialize on form submit
+  const form = document.closest('form') || document.querySelector('form');
+  if (form) {
+    form.addEventListener('submit', serialize);
+  }
+
+  // Initial serialization
+  serialize();
+})();
+</script>

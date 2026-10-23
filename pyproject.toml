@@ -17,6 +17,12 @@ dependencies = [
     "jinja2",
     "starlette!=0.36.0",  # avoid bad version https://github.com/encode/starlette/discussions/2436
     "uvicorn[standard]",
+    "pyyaml",
+    "argon2-cffi",
+    "aiosqlite",
+    "greenlet",
+    "joserfc>=0.11.0",
+    "httpx>=0.27.0"
 ]
 
 [project.urls]
@@ -25,15 +31,17 @@ Homepage = "https://github.com/dagster-io/dagster"
 [project.scripts]
 dagster-webserver = "dagster_webserver.cli:main"
 dagster-webserver-debug = "dagster_webserver.debug:main"
+dagster-agent = "dagster_agent.cli:cli"
 
 [tool.hatch.build]
 artifacts = ["dagster_webserver/webapp/build/"]
 
+[tool.hatch.build.targets.wheel]
+packages = ["dagster_webserver", "dagster_agent"]
+
 [project.optional-dependencies]
 notebook = ["nbconvert"]  # notebooks support
-auth = ["pyyaml", "argon2-cffi", "aiosqlite", "greenlet"]  # YAML user file support + argon2id password hashing + async SQLite
-auth-db = ["asyncpg"]  # Async PostgreSQL driver for production
-auth-oidc = ["joserfc>=0.11.0", "httpx>=0.27.0"]  # OIDC login support
+db = ["asyncpg"]  # Async PostgreSQL driver for production
 
 [dependency-groups]
 test = [

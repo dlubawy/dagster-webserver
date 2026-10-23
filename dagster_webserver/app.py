@@ -58,6 +58,14 @@ def create_app_from_workspace_process_context(
                 auth_provider=auth_provider,
             )
 
+    # Build lifespan for background tasks (stale request requeue)
+    if "lifespan" not in kwargs and auth_provider is not None:
+        from dagster_webserver.api.background import build_agent_lifespan
+
+        session_factory = _get_session_factory(auth_provider)
+        if session_factory:
+            kwargs["lifespan"] = build_agent_lifespan(session_factory)
+
     asgi_app = DagsterWebserver(
         workspace_process_context,
         path_prefix,
@@ -72,6 +80,15 @@ def create_app_from_workspace_process_context(
         _add_session_middleware(asgi_app, auth_provider)
 
     return asgi_app
+
+
+def _get_session_factory(auth_provider: BaseAuthProvider):
+    """Extract the async session factory from a database-backed auth provider."""
+    user_backend = getattr(auth_provider, "_user_backend", None)
+    if user_backend is None:
+        return None
+    # DatabaseUserBackend has a _session_factory attribute
+    return getattr(user_backend, "_session_factory", None)
 
 
 def _add_session_middleware(app: Starlette, auth_provider: BaseAuthProvider) -> None:

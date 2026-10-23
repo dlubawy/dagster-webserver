@@ -1,5 +1,25 @@
 # Implementation Plan — DagsterAgent for OSS
 
+## Status (2026-10-23)
+
+| Phase | Description | Status |
+| ----- | -------------------------------------- | ------------------------------------------- |
+| 1 | Database Schema and Models | ✅ Complete |
+| 2 | Webserver REST API and API Key Auth | ✅ Complete (incl. admin portal UI) |
+| 3 | Agent Package — Core Types and CLI | ✅ Complete |
+| 4 | DagsterAgentInstance and Launcher Base | ✅ Complete |
+| 5 | Process Launcher and Agent Main Loop | ✅ Complete |
+| 6 | Daemon Integration (Core) | ✅ Complete |
+| 7 | K8s and Docker Launchers | ✅ Complete |
+| 8 | Production Hardening | ✅ Complete |
+
+**Test count**: 377 passing (265 webserver + 112 agent)
+
+All phases are implemented, including the originally deferred Phase 2 sub-tasks:
+
+- Task 2.5: Admin Portal — Code Locations and Service Accounts UI ✅
+- Task 2.5b: Admin Portal — Scoped Role Assignment UI ✅
+
 ## Scope
 
 Build a `dagster-agent` process that replaces `dagster-cloud agent run` for DAGSTER OSS. The agent connects to our forked `dagster-webserver`, manages code location gRPC servers via pluggable launchers, and processes work requests from a database-backed queue.
@@ -703,6 +723,20 @@ Implement background task on the webserver that re-queues expired requests:
 - Set status back to `'pending'`, clear `assigned_to_agent`.
 
 **Outcome**: Crashed agents don't leave requests permanently stuck.
+
+### Task 6.5: Agent Workspace File for Native Daemon ✅
+
+The native `dagster-daemon` requires a workspace to resolve code locations.
+When using `--agent-workspaces`, the webserver maintains a YAML file with current
+gRPC server entries that the daemon can consume via `--workspace`.
+
+- **File path**: `<instance.root_directory>/agent_workspace.yaml` (overridable via `--agent-workspace-file`)
+- **Format**: Standard Dagster workspace YAML with `load_from` + `grpc_server` entries
+- **Seeding**: File is created immediately on webserver start with `load_from: []`
+- **Updates**: Refreshed every 30s by `AgentWorkspaceRefresher` (atomic write via temp+rename)
+- **Daemon usage**: `python -m dagster._daemon run --workspace $DAGSTER_HOME/agent_workspace.yaml`
+
+**Outcome**: Native daemon can resolve agent-managed code locations without forking.
 
 ______________________________________________________________________
 

@@ -274,7 +274,7 @@
               );
         in
         {
-          default = pythonSet.mkVirtualEnv "dagster-webserver-env" workspace.deps.default;
+          default = pythonSet.mkVirtualEnv "dagster-webserver-env" workspace.deps.all;
           dagster-js-modules = dagster-js-modules;
         }
       );
@@ -332,6 +332,7 @@
                           (old.src + "/pyproject.toml")
                           (old.src + "/README.md")
                           (old.src + "/dagster_webserver")
+                          (old.src + "/dagster_agent")
                         ];
                       };
 
@@ -380,6 +381,7 @@
 
                 shell = "zsh";
                 NIL_PATH = "${pkgs.nil}/bin/nil";
+                LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib";
               };
 
               shellHook = lib.strings.concatLines [

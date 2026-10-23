@@ -111,6 +111,22 @@ class SessionAuthProvider(BaseAuthProvider):
         self._user_backend = user_backend
 
     async def authenticate_request(self, request: Request) -> AuthUser | None:
+        # Check for API key auth first (Bearer token)
+        headers = getattr(request, "headers", {})
+        auth_header = (
+            headers.get("Authorization", "") if hasattr(headers, "get") else ""
+        )
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            if token:
+                user = await self._user_backend.get_user_by_api_key(token)
+                if user:
+                    request.state.user = user
+                    return user
+                # Bearer header present but invalid — don't fall through to session
+                return None
+
+        # Fall back to session auth
         session: dict = getattr(request, "session", {}) or {}
         username = session.get("username")
         if not username:

@@ -2,9 +2,9 @@
 {% block title %}Edit {{ view.label }}: {{ pk }} — Dagster Admin{% endblock %}
 {% block content %}
 <div class="actions-bar">
-  <h2 style="flex: 1;">Edit {{ view.label }}: {{ pk }}</h2>
+  <h2 class="page-title" style="flex: 1; margin-bottom: 0;">Edit {{ view.label }}: {{ pk }}</h2>
   <a href="/admin/{{ view.identity }}/list" class="btn btn-secondary">
-    <i class="fas fa-arrow-left"></i> Back to list
+    {{ icon("arrow-left", 14) }} Back to list
   </a>
   {% if view.can_delete(request) %}
   <form method="post" action="/admin/{{ view.identity }}/row-action"
@@ -12,7 +12,7 @@
     <input type="hidden" name="action_name" value="delete"/>
     <input type="hidden" name="pk" value="{{ pk }}"/>
     <button type="submit" class="btn btn-danger">
-      <i class="fas fa-trash"></i> Delete
+      {{ icon("trash", 14) }} Delete
     </button>
   </form>
   {% endif %}
@@ -49,7 +49,17 @@
     </label>
     {% elif field == 'username' %}
     <input type="text" id="{{ field }}" name="{{ field }}" value="{{ obj[field] }}" readonly
-           style="background: #f5f6f8; color: #6f7a91;" title="Username cannot be changed"/>
+           style="background: var(--bg-input); color: var(--text-lighter);" title="Username cannot be changed"/>
+    {% elif field == 'status' and view.identity == 'code-locations' %}
+    {# Lifecycle status the agent acts on: paused locations are torn down #}
+    <select id="{{ field }}" name="{{ field }}">
+      {% for option in ['active', 'paused'] %}
+      <option value="{{ option }}"
+              {% if (form.get(field, obj.get(field)) if form else obj.get(field)) == option %}selected{% endif %}>
+        {{ option | capitalize }}
+      </option>
+      {% endfor %}
+    </select>
     {% else %}
     <input type="{% if field == 'email' %}email{% else %}text{% endif %}"
            id="{{ field }}" name="{{ field }}"
@@ -57,6 +67,14 @@
     {% endif %}
   </div>
   {% endfor %}
+
+  {# Role assignments widget for users and service accounts #}
+  {% if view.identity in ('users', 'service-accounts') %}
+  <div class="form-group">
+    <label>Role Assignments</label>
+    {% include "_role_assignments.html" %}
+  </div>
+  {% endif %}
 
   <button type="submit" class="btn btn-primary">Save Changes</button>
 </form>

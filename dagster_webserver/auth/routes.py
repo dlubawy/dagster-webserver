@@ -28,6 +28,25 @@ _LOGIN_TEMPLATE = """\
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no"/>
 <title>Dagster — Sign in</title>
+<!-- Sync with the webapp theme setting (Settings > Theme): the webapp stores
+     its choice in localStorage under "dagster-theme" ("Light" / "Dark" /
+     unset = follow system); mirror it as a class on <html> before paint. -->
+<script>
+(function () {
+  try {
+    var t = window.localStorage.getItem("dagster-theme");
+    // The webapp stores the value JSON-stringified (e.g. '"Dark"')
+    if (t) {
+      try { t = JSON.parse(t); } catch (e) { /* keep raw value */ }
+    }
+    if (t && t.indexOf("Dark") === 0) {
+      document.documentElement.classList.add("themeDark");
+    } else if (t && t.indexOf("Light") === 0) {
+      document.documentElement.classList.add("themeLight");
+    }
+  } catch (e) { /* storage unavailable — fall back to OS preference */ }
+})();
+</script>
 <style>
 /* ── Reset & base ─────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -65,8 +84,30 @@ body {
   --shadow-card: 0 1px 3px rgba(3,6,21,.08), 0 4px 12px rgba(3,6,21,.04);
   --focus-ring: #4f438d;
 }
+/* Dark tokens — applied when the webapp theme setting is explicitly "Dark". */
+.themeDark {
+  --bg: #030615;
+  --bg-card: #171c2c;
+  --bg-input: #1d2237;
+  --bg-input-hover: #232844;
+  --bg-input-focus: #171c2c;
+  --text-default: #ffffff;
+  --text-light: #9ea7b9;
+  --text-lighter: #6f7a91;
+  --border-default: #2b3244;
+  --border-focus: #4f438d;
+  --accent-primary: #4f438d;
+  --accent-primary-hover: #7269e4;
+  --accent-reversed: #ffffff;
+  --error-bg: #2d1519;
+  --error-text: #e5a0a0;
+  --error-border: #5c2a30;
+  --shadow-card: 0 1px 3px rgba(0,0,0,.2), 0 4px 12px rgba(0,0,0,.12);
+  --focus-ring: #7269e4;
+}
+/* No explicit theme setting — fall back to the OS preference. */
 @media (prefers-color-scheme: dark) {
-  :root:not(.themeLight) {
+  :root:not(.themeLight):not(.themeDark) {
     --bg: #030615;
     --bg-card: #171c2c;
     --bg-input: #1d2237;
@@ -384,6 +425,27 @@ async def login_endpoint(
         )
 
     if not user:
+        if "text/html" in request.headers.get("Accept", ""):
+            oidc_providers = []
+            if hasattr(provider, "get_oidc_providers"):
+                oidc_providers = await provider.get_oidc_providers()
+            return HTMLResponse(
+                _render_login(
+                    "Invalid username or password", oidc_providers=oidc_providers
+                ),
+                status_code=HTTP_400_BAD_REQUEST,
+            )
+        return JSONResponse(
+            {"error": "Invalid username or password"},
+            status_code=HTTP_400_BAD_REQUEST,
+        )
+
+    # Reject service account logins — they authenticate via API key only.
+    # Use the same generic error to avoid revealing the account exists.
+    if getattr(user, "is_service_account", False):
+        logger.warning(
+            "Service account '%s' attempted password login (rejected)", username
+        )
         if "text/html" in request.headers.get("Accept", ""):
             oidc_providers = []
             if hasattr(provider, "get_oidc_providers"):
