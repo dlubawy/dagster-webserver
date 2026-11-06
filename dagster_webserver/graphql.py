@@ -149,6 +149,11 @@ class GraphQLServer(ABC, Generic[TRequestContext]):
         query = data.get("query")
         variables: str | None | dict[str, Any] = data.get("variables")
         operation_name = data.get("operationName")
+        if operation_name == "LaunchPipelineExecution":
+            if request.session.get("username"):
+                variables["executionParams"]["executionMetadata"]["tags"].append(
+                    {"key": "user", "value": request.session["username"]}
+                )
 
         if query is None:
             return PlainTextResponse(
@@ -211,7 +216,9 @@ class GraphQLServer(ABC, Generic[TRequestContext]):
                         operation_name=data.get("operation_name"),
                     )
                     if error_payload:
-                        await _send_message(websocket, GraphQLWS.ERROR, error_payload, operation_id)
+                        await _send_message(
+                            websocket, GraphQLWS.ERROR, error_payload, operation_id
+                        )
                         continue
 
                     assert task is not None
@@ -349,7 +356,9 @@ class GraphQLServer(ABC, Generic[TRequestContext]):
 
             if isinstance(async_result, ExecutionResult):
                 if not async_result.errors:
-                    check.failed(f"Only expect non-async result on error, got {async_result}")
+                    check.failed(
+                        f"Only expect non-async result on error, got {async_result}"
+                    )
                 handled_errors = self.handle_graphql_errors(async_result.errors)
                 # return only one entry for subscription response
                 return None, handled_errors[0]
@@ -400,7 +409,9 @@ class GraphQLServer(ABC, Generic[TRequestContext]):
         return status.HTTP_200_OK
 
 
-async def _handle_async_results(results: AsyncGenerator, operation_id: str, websocket: WebSocket):
+async def _handle_async_results(
+    results: AsyncGenerator, operation_id: str, websocket: WebSocket
+):
     try:
         async for result in results:
             payload = {"data": result.data}
